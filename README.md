@@ -1,4 +1,4 @@
-# LOL ARAM Hextech Helper (大乱斗海克斯助手)
+# LOL ARAM Mayhem Hextech Helper (大乱斗海克斯助手)
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
@@ -33,8 +33,8 @@
 
 1.  **克隆仓库**:
     ```bash
-    git clone https://github.com/Nyx0ra/lol-aram-hextech-helper.git
-    cd lol-aram-hextech-helper
+    git clone https://github.com/Nyx0ra/lol-aram-mayhem-hextech-helper.git
+    cd lol-aram-mayhem-hextech-helper
     ```
 
 2.  **安装依赖**:
