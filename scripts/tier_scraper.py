@@ -133,7 +133,7 @@ def scrape_all_augments():
     # -------------------------------------------------
     # C. 输出结果
     # -------------------------------------------------
-    output_file = "augments.json"
+    output_file = "data/tiers.json"
     print(f">>> 正在保存结果到 {output_file} ...")
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
