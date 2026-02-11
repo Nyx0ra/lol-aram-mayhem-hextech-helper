@@ -63,6 +63,13 @@ python main.py
     * <span style="color:gold">**金色文字**</span>：最优推荐。
     * <span style="color:green">**绿色文字**</span>：普通推荐。
     * <span style="color:red">**红色文字**</span>：未识别/无数据。
+
+    <p align="center">
+      <img src="./docs/demo.png" width="600" alt="功能演示">
+      <br>
+      <em>图：海克斯识别与颜色提示效果展示</em>
+    </p>
+
 * **`F8` - 重置/下一局**: 想更换英雄时按下 **F8**，控制台会重新弹出。
 
 ---
