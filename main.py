@@ -40,15 +40,19 @@ class DataManager:
         self.hero_data = {}
         self.pinyin_map = {}
         self.tier_map = {}
+        # 动态获取 data 文件夹的绝对路径
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.data_dir = os.path.join(self.base_dir, 'data')
         self._load_data()
 
     def _load_data(self):
         print("--- 正在加载数据资源 ---")
 
-        # 1. 加载强化符文等级映射
-        if os.path.exists('augments.json'):
+        # 1. 加载强化符文等级映射 (修正路径)
+        tier_file = os.path.join(self.data_dir, 'tiers.json')
+        if os.path.exists(tier_file):
             try:
-                with open('augments.json', 'r', encoding='utf-8') as f:
+                with open(tier_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 tier_cn_map = {"silver": "白银", "gold": "黄金", "prismatic": "棱彩"}
                 for en_tier, cn_tier in tier_cn_map.items():
@@ -56,16 +60,15 @@ class DataManager:
                         for name in data[en_tier]: 
                             self.tier_map[name] = cn_tier
             except Exception as e:
-                print(f"⚠️ augments.json 加载异常: {e}")
+                print(f"⚠️ {tier_file} 加载异常: {e}")
 
-        # 2. 加载英雄数据 (CSV)
-        csv_path = 'aram_augments_final.csv'
+        # 2. 加载英雄数据 (CSV) (修正路径)
+        csv_path = os.path.join(self.data_dir, 'hero_augments.csv')
         if not os.path.exists(csv_path):
             print(f"❌ 错误: 找不到文件 {csv_path}")
-            print(f"   请确认该文件位于: {os.getcwd()}")
+            print(f"   请确认该文件位于: {self.data_dir}")
         else:
             try:
-                # 尝试自动检测编码 (优先 utf-8-sig)
                 encoding = 'utf-8-sig'
                 try:
                     with open(csv_path, 'r', encoding=encoding) as f: f.read(100)
@@ -78,7 +81,6 @@ class DataManager:
                     next(reader, None) # 跳过表头
                     for row in reader:
                         if len(row) < 4: continue
-                        # CSV结构: Hero, ?, Rank, AugmentName
                         hero = row[0].strip()
                         try: rank = int(row[2])
                         except: rank = 999
@@ -104,16 +106,17 @@ class DataManager:
             except Exception as e:
                 print(f"❌ CSV 读取严重失败: {e}")
 
-        # 3. 加载拼音映射
-        if os.path.exists('output_pinyin.json'):
+        # 3. 加载拼音映射 (修正路径)
+        pinyin_file = os.path.join(self.data_dir, 'pinyin_map.json')
+        if os.path.exists(pinyin_file):
             try:
-                with open('output_pinyin.json', 'r', encoding='utf-8') as f:
+                with open(pinyin_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for cn, py in data.items():
                         self.pinyin_map[py] = cn
                         self.pinyin_map[cn] = cn
             except Exception as e:
-                print(f"⚠️ 拼音表加载异常: {e}")
+                print(f"⚠️ {pinyin_file} 加载异常: {e}")
         
         print("-> 数据初始化完成")
 
