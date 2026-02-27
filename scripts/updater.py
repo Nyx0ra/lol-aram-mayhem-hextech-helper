@@ -1,203 +1,121 @@
+# --- START OF FILE tier_scraper.py ---
+import time
 import json
-import csv
 import os
-import requests
-import sys
-# 【修复】补上了这个关键的 import
-from pypinyin import lazy_pinyin 
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
-# 1. 解决同级导入问题
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
-import hero_scraper as crawler
+# ==========================================
+# 1. 浏览器初始化
+# ==========================================
+def setup_driver():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless") 
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    # 强制中文环境
+    chrome_options.add_argument("--lang=zh-CN")
+    chrome_options.add_experimental_option('prefs', {'intl.accept_languages': 'zh-CN,zh;q=0.9'})
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
 
-# 2. 解决路径问题
-BASE_DIR = os.path.dirname(current_dir)
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-
-# 配置路径 (移除了 TEMP_FILE)
-CHAMPION_ID_FILE = os.path.join(DATA_DIR, "champions.json")
-PINYIN_FILE      = os.path.join(DATA_DIR, "pinyin_map.json")
-CSV_FILE         = os.path.join(DATA_DIR, "hero_augments.csv")
-CSV_HEADER       = ["中文名", "英文名", "序号", "海克斯名称"]
-
-# ================= 1. 数据真理同步 =================
-def sync_official_data():
-    print(">>> [1/4] 正在同步官方英雄数据...")
+# ==========================================
+# 2. 全量海克斯抓取逻辑 (含数据保护逻辑)
+# ==========================================
+def scrape_all_augments(output_file="data/tiers.json"):
+    url = "https://blitz.gg/lol/aram-mayhem-augments"
+    print(f"\n--- 开始拉取海克斯分级: 正在访问 {url} ---")
+    
+    driver = setup_driver()
+    results = {
+        "prismatic": [],
+        "gold":[],
+        "silver":[]
+    }
+    
+    # 【新增】成功标识符，用于判断是否要覆盖写入文件
+    success_flag = False 
+    
     try:
-        ver_url = "https://ddragon.leagueoflegends.com/api/versions.json"
-        version = requests.get(ver_url).json()[0]
-        print(f"    当前游戏版本: {version}")
+        driver.get(url)
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(2)
 
-        champ_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/zh_CN/champion.json"
-        data = requests.get(champ_url).json()['data']
-
-        new_champion_map = {}
-        for en_id, info in data.items():
-            cn_name = info['name']
-            new_champion_map[cn_name] = en_id
-
-        old_keys = set()
-        if os.path.exists(CHAMPION_ID_FILE):
-            with open(CHAMPION_ID_FILE, 'r', encoding='utf-8') as f:
-                old_data = json.load(f)
-                old_keys = set(old_data.keys())
-
-        with open(CHAMPION_ID_FILE, 'w', encoding='utf-8') as f:
-            json.dump(new_champion_map, f, indent=4, ensure_ascii=False)
+        # A. 滚动加载
+        print("   > 正在滚动加载页面...")
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        for i in range(20):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                print("   > 页面加载完成。")
+                break
+            last_height = new_height
         
-        new_keys = set(new_champion_map.keys())
-        diff = new_keys - old_keys
+        # B. 解析与分类
+        print("   > 正在解析数据...")
+        target_map =[
+            ("prismatic", "Prismatic ARAM Mayhem Augments"),
+            ("gold", "Gold ARAM Mayhem Augments"),
+            ("silver", "Silver ARAM Mayhem Augments")
+        ]
         
-        print(f"    同步完成。共 {len(new_champion_map)} 个英雄。")
-        if diff:
-            print(f"    发现 {len(diff)} 个新增/改名英雄: {', '.join(diff)}")
-        else:
-            print("    无新增英雄。")
+        for key, search_text in target_map:
+            print(f"     -> 正在提取分类: {key} ...")
+            tier_keyword = search_text.split()[0] 
             
-        return new_champion_map, list(diff)
+            xpath_query = (
+                f"//section[descendant::*[contains(text(), '{tier_keyword}') "
+                f"and contains(text(), 'Augments')]]"
+                f"//h4[contains(@class, 'augment-name')]"
+            )
+            
+            elements = driver.find_elements(By.XPATH, xpath_query)
+            extracted_names =[]
+            for el in elements:
+                text = el.text.strip()
+                if text and text not in extracted_names:
+                    extracted_names.append(text)
+            
+            if not extracted_names:
+                print(f"     [警告] 未能在 {key} 分类下找到数据。")
+            else:
+                print(f"     ✅ 成功提取 {len(extracted_names)} 个海克斯。")
+                results[key] = extracted_names
+
+        # 【新增】检查是否真正抓到了数据（总数大于0就算成功）
+        total_extracted = sum(len(v) for v in results.values())
+        if total_extracted > 0:
+            success_flag = True
 
     except Exception as e:
-        print(f"!!! 官方数据同步失败，请检查网络: {e}")
-        return {}, []
-
-# ================= 2. 拼音生成 =================
-def update_pinyin_file(champion_map):
-    print(">>> [2/4] 更新拼音检索文件...")
-    pinyin_data = {}
-    for cn_name in champion_map.keys():
-        pinyin_list = lazy_pinyin(cn_name)
-        initials = "".join([p[0].lower() for p in pinyin_list if p])
-        pinyin_data[cn_name] = initials
-    
-    with open(PINYIN_FILE, 'w', encoding='utf-8') as f:
-        json.dump(pinyin_data, f, indent=4, ensure_ascii=False)
-    print("    拼音文件已更新。")
-
-# ================= 3. 数据保护逻辑 (读CSV) =================
-def load_csv_history():
-    """读取现有CSV到内存，用于在爬取失败时保留旧数据"""
-    print(">>> [3/4] 读取本地历史数据 (数据保护)...")
-    history = {}
-    if not os.path.exists(CSV_FILE):
-        return history
-
-    try:
-        with open(CSV_FILE, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                cn_name = row.get('中文名')
-                if cn_name:
-                    if cn_name not in history:
-                        history[cn_name] = []
-                    history[cn_name].append(row)
-        print(f"    已加载 {len(history)} 个英雄的历史数据。")
-    except Exception as e:
-        print(f"⚠️ 读取历史CSV时出错 (可能是空文件): {e}")
-    
-    return history
-
-# ================= 4. 合并与保存 =================
-def merge_and_save(champion_map, history_data, new_crawl_data):
-    """
-    核心逻辑：
-    1. 遍历最新的 champion_map。
-    2. 优先使用本次爬取的新数据 (new_crawl_data)。
-    3. 如果没有新数据，回退使用历史数据 (history_data)。
-    4. 都没有？记录为缺失。
-    """
-    print(">>> [4/4] 执行数据合并与持久化...")
-    final_rows = []
-    missing_data_champions = []
-
-    for cn_name, en_name in champion_map.items():
-        rows_to_write = []
-
-        # 策略A：本次爬取成功，使用新数据（覆盖旧的）
-        if cn_name in new_crawl_data:
-            for item in new_crawl_data[cn_name]:
-                rows_to_write.append({
-                    "中文名": cn_name,
-                    "英文名": en_name,
-                    "序号": item['index'],
-                    "海克斯名称": item['name']
-                })
+        print(f"!!! 发生异常: {e}")
         
-        # 策略B：本次未爬取或失败，保留旧数据（数据保护）
-        elif cn_name in history_data:
-            rows_to_write = history_data[cn_name]
-            # 顺便更新一下旧数据里的英文名，防止官方改了英文ID导致不一致
-            for row in rows_to_write:
-                row['英文名'] = en_name
-        
-        # 策略C：既无新数据也无旧数据
-        else:
-            missing_data_champions.append(cn_name)
-        
-        if rows_to_write:
-            final_rows.extend(rows_to_write)
+    finally:
+        driver.quit()
 
-    # 写入 CSV
-    try:
-        with open(CSV_FILE, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-            writer.writeheader()
-            writer.writerows(final_rows)
-        print(f"✅ 写入完成！主文件: {CSV_FILE} (共 {len(final_rows)} 条数据)")
-    except Exception as e:
-        print(f"❌ 写入主文件失败: {e}")
-
-# ================= 主程序 =================
-def main():
-    print("=== ARAM 数据自动维护管理器 v5.0 (无缓存版) ===\n")
-
-    # 1. 同步官方数据
-    champion_map, new_champs = sync_official_data()
-    if not champion_map:
-        return
-
-    # 2. 更新拼音
-    update_pinyin_file(champion_map)
-
-    # 3. 加载历史数据
-    history_data = load_csv_history()
-
-    # 4. 选择爬取模式
-    print("\n请选择爬取策略:")
-    print("   [1] 增量模式 (新英雄 + 本地缺失数据的英雄)")
-    print("   [2] 全量模式 (强制重新爬取所有英雄)")
-    print("   [3] 补漏模式 (仅爬取 CSV 中不存在的英雄)")
-    
-    choice = input("请输入选项 (默认1): ").strip()
-    
-    target_list = [] 
-
-    if choice == '2':
-        target_list = list(champion_map.items())
-    elif choice == '3':
-        for cn, en in champion_map.items():
-            if cn not in history_data:
-                target_list.append((cn, en))
+    # C. 输出结果 (数据保护核心拦截点)
+    if success_flag:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        print(f"   > 正在保存最新结果到 {output_file} ...")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=4)
+        print("--- 海克斯分级字典更新完成 ---\n")
     else:
-        # 默认增量
-        for cn, en in champion_map.items():
-            if (cn in new_champs) or (cn not in history_data):
-                target_list.append((cn, en))
-
-    new_crawl_data = {}
-    if target_list:
-        print(f"\n>>> 准备爬取 {len(target_list)} 个英雄...")
-        # 爬虫现在直接返回数据字典，不写文件
-        new_crawl_data, failed_list = crawler.crawl_champions(target_list)
-        
-        if failed_list:
-            print(f"\n⚠️ 本次爬取失败: {failed_list}")
-            print("    (不用担心，旧数据会被自动保留)")
-    else:
-        print("    没有需要爬取的目标。")
-
-    # 5. 合并并保存 (这里会处理新旧数据的优先级)
-    merge_and_save(champion_map, history_data, new_crawl_data)
+        print(f"   > ❌ 拉取失败或未获取到任何数据！")
+        print(f"   > 🛡️ 已触发数据保护，直接跳过保存，原有 {output_file} 数据安全保留。")
+        print("--- 海克斯分级字典更新中止 ---\n")
 
 if __name__ == "__main__":
-    main()
+    # 本地单独测试时，放在当前目录下
+    scrape_all_augments("tiers_test.json")
