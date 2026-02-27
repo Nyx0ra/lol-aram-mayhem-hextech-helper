@@ -29,7 +29,7 @@ def setup_driver():
     return driver
 
 # ==========================================
-# 2. 全量海克斯抓取逻辑 (增加 output_file 参数)
+# 2. 全量海克斯抓取逻辑 (含数据保护逻辑)
 # ==========================================
 def scrape_all_augments(output_file="data/tiers.json"):
     url = "https://blitz.gg/lol/aram-mayhem-augments"
@@ -41,6 +41,9 @@ def scrape_all_augments(output_file="data/tiers.json"):
         "gold":[],
         "silver":[]
     }
+    
+    # 【新增】成功标识符，用于判断是否要覆盖写入文件
+    success_flag = False 
     
     try:
         driver.get(url)
@@ -85,10 +88,15 @@ def scrape_all_augments(output_file="data/tiers.json"):
                     extracted_names.append(text)
             
             if not extracted_names:
-                print(f"     [警告] 未能在 {key} 分类下找到数据，可能是页面语言或结构变更。")
+                print(f"     [警告] 未能在 {key} 分类下找到数据。")
             else:
                 print(f"     ✅ 成功提取 {len(extracted_names)} 个海克斯。")
                 results[key] = extracted_names
+
+        # 【新增】检查是否真正抓到了数据（总数大于0就算成功）
+        total_extracted = sum(len(v) for v in results.values())
+        if total_extracted > 0:
+            success_flag = True
 
     except Exception as e:
         print(f"!!! 发生异常: {e}")
@@ -96,9 +104,18 @@ def scrape_all_augments(output_file="data/tiers.json"):
     finally:
         driver.quit()
 
-    # C. 输出结果 (确保目录存在)
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    print(f"   > 正在保存结果到 {output_file} ...")
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=4)
-    print("--- 海克斯分级字典更新完成 ---\n")
+    # C. 输出结果 (数据保护核心拦截点)
+    if success_flag:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        print(f"   > 正在保存最新结果到 {output_file} ...")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=4)
+        print("--- 海克斯分级字典更新完成 ---\n")
+    else:
+        print(f"   > ❌ 拉取失败或未获取到任何数据！")
+        print(f"   > 🛡️ 已触发数据保护，直接跳过保存，原有 {output_file} 数据安全保留。")
+        print("--- 海克斯分级字典更新中止 ---\n")
+
+if __name__ == "__main__":
+    # 本地单独测试时，放在当前目录下
+    scrape_all_augments("tiers_test.json")
