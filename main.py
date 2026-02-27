@@ -38,7 +38,8 @@ class DataManager:
     """负责加载和管理静态数据"""
     def __init__(self):
         self.hero_data = {}
-        self.pinyin_map = {}
+        # 拼音映射改为 defaultdict(list)，支持一个拼音对应多个英雄
+        self.pinyin_map = defaultdict(list)
         self.tier_map = {}
         # 动态获取 data 文件夹的绝对路径
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +49,7 @@ class DataManager:
     def _load_data(self):
         print("--- 正在加载数据资源 ---")
 
-        # 1. 加载强化符文等级映射 (修正路径)
+        # 1. 加载强化符文等级映射
         tier_file = os.path.join(self.data_dir, 'tiers.json')
         if os.path.exists(tier_file):
             try:
@@ -62,7 +63,7 @@ class DataManager:
             except Exception as e:
                 print(f"⚠️ {tier_file} 加载异常: {e}")
 
-        # 2. 加载英雄数据 (CSV) (修正路径)
+        # 2. 加载英雄数据 (CSV)
         csv_path = os.path.join(self.data_dir, 'hero_augments.csv')
         if not os.path.exists(csv_path):
             print(f"❌ 错误: 找不到文件 {csv_path}")
@@ -106,48 +107,40 @@ class DataManager:
             except Exception as e:
                 print(f"❌ CSV 读取严重失败: {e}")
 
-        # 3. 加载拼音映射 (修正路径)
+        # 3. 加载拼音映射 (构建一对多关系)
         pinyin_file = os.path.join(self.data_dir, 'pinyin_map.json')
         if os.path.exists(pinyin_file):
             try:
                 with open(pinyin_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for cn, py in data.items():
-                        self.pinyin_map[py] = cn
-                        self.pinyin_map[cn] = cn
+                        if cn not in self.pinyin_map[py]:
+                            self.pinyin_map[py].append(cn)
+                        if cn not in self.pinyin_map[cn]:
+                            self.pinyin_map[cn].append(cn)
             except Exception as e:
                 print(f"⚠️ {pinyin_file} 加载异常: {e}")
         
         print("-> 数据初始化完成")
 
     def search_hero(self, query):
-        """英雄搜索逻辑 (增强模糊匹配)"""
+        """
+        英雄搜索逻辑 (增强模糊匹配)
+        返回: (匹配列表, 是否精确匹配)
+        """
         query = query.strip().lower()
         
-        # 1. 尝试拼音/中文直接匹配
-        matched_name = self.pinyin_map.get(query)
+        # 1. 尝试拼音/中文直接匹配 (O(1))，返回的是一个列表
+        if query in self.pinyin_map:
+            return self.pinyin_map[query], True
         
         # 2. 如果没找到，在数据Key中模糊搜索
-        if not matched_name and self.hero_data:
+        if self.hero_data:
             guess, score = process.extractOne(query, list(self.hero_data.keys()))
             if score > 60:
-                matched_name = guess
-                return matched_name, False # 非精确匹配，需要确认
+                return [guess], False
 
-        # 3. 名称修正：如果找到了名字但数据里没Key (如 称号 vs 本名)
-        if matched_name and matched_name not in self.hero_data:
-            real_name, score = process.extractOne(matched_name, list(self.hero_data.keys()))
-            if score > 80:
-                print(f"ℹ️ 自动修正映射: {matched_name} -> {real_name}")
-                matched_name = real_name
-            else:
-                print(f"❌ 警告: 找到了 '{matched_name}' 但数据库无此英雄数据")
-                return None, False
-
-        if matched_name:
-            return matched_name, True
-            
-        return None, False
+        return[], False
 
 # ================= 2. 图像分析 (Core Logic) =================
 
@@ -247,12 +240,12 @@ class GameAnalyzer:
         if not hero_cn: return {}
         print(f"正在分析: {hero_cn}...")
         
-        futures = []
+        futures =[]
         for key in ["hex_1", "hex_2", "hex_3"]:
             futures.append(self.executor.submit(self._process_single, key, hero_cn))
         
         results = {}
-        valid_matches = []
+        valid_matches =[]
         
         for f in futures:
             try:
@@ -392,7 +385,7 @@ class InputController(threading.Thread):
             self.listening_phase()
 
     def flush_input(self):
-        """核心修复：强制清空标准输入缓冲区"""
+        """强制清空标准输入缓冲区"""
         while msvcrt.kbhit():
             msvcrt.getch()
 
@@ -402,36 +395,77 @@ class InputController(threading.Thread):
         
         time.sleep(0.1)
         os.system('cls')
-        self.flush_input() # 清空残留按键
+        self.flush_input()
 
         print("=== ARAM 助手 (F8重新输入) ===")
         print(">>> 请输入英雄名称 (拼音/中文):")
 
         while True:
             try:
-                self.flush_input() # 再次清空，确保输入干净
+                self.flush_input()
                 raw = input("Input: ").strip()
             except EOFError: continue
             
             if not raw: continue
             
-            name, exact = self.dm.search_hero(raw)
-            if name:
-                if not exact:
-                    print(f"   猜你是: {name}? (Enter确认 / n重输)")
+            # 获取匹配列表
+            matches, is_exact = self.dm.search_hero(raw)
+            selected_name = None
+
+            if not matches:
+                print("❌ 未找到，请重试")
+                continue
+
+            # === 处理多个匹配项 ===
+            if len(matches) > 1:
+                print(f"🤔 发现多个匹配项，请选择:")
+                for idx, name in enumerate(matches):
+                    print(f"   {idx + 1}. {name}")
+                
+                print(">>> 请输入序号 (1, 2...):")
+                self.flush_input()
+                try:
+                    choice = input("Select: ").strip()
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(matches):
+                        selected_name = matches[idx]
+                    else:
+                        print("❌ 序号无效，请重新输入英雄名")
+                        continue
+                except ValueError:
+                    print("❌ 输入错误，请重新输入英雄名")
+                    continue
+            
+            # === 处理单个匹配项 ===
+            else:
+                candidate = matches[0]
+                if is_exact:
+                    selected_name = candidate
+                else:
+                    print(f"   猜你是: {candidate}? (Enter确认 / n重输)")
                     self.flush_input()
                     if input().strip().lower() == 'n':
                         continue
-                
-                self.current_hero = name
-                print(f"✅ 锁定: {name}")
+                    selected_name = candidate
+
+            # === 最终锁定逻辑 ===
+            if selected_name:
+                if selected_name not in self.dm.hero_data:
+                    real_name, score = process.extractOne(selected_name, list(self.dm.hero_data.keys()))
+                    if score > 80:
+                        print(f"ℹ️ 自动映射: {selected_name} -> {real_name}")
+                        selected_name = real_name
+                    else:
+                        print(f"❌ 数据库暂无【{selected_name}】的数据")
+                        continue
+
+                self.current_hero = selected_name
+                print(f"✅ 锁定: {selected_name}")
                 print(">>> 切回游戏，按 [F6] 分析")
                 
-                self.queue.put({"cmd": "STATUS", "data": f"当前: {name}\n按 F6 分析"})
+                self.queue.put({"cmd": "STATUS", "data": f"当前: {selected_name}\n按 F6 分析"})
                 self.hide_console_window()
                 break
-            else:
-                print("❌ 未找到，请重试")
 
     def listening_phase(self):
         self.flush_input() # 清除确认时的回车键残留
@@ -467,16 +501,16 @@ class InputController(threading.Thread):
     def hide_console_window():
         try:
             hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-            ctypes.windll.user32.ShowWindow(hwnd, 6) # SW_MINIMIZE (保持最小化比完全隐藏更安全)
+            ctypes.windll.user32.ShowWindow(hwnd, 6) # SW_MINIMIZE
         except: pass
 
 # ================= 5. 主入口 =================
 
 def main():
-    # 【关键修复】强制设置工作目录为脚本所在目录
-    # 解决快捷方式或不同终端启动导致找不到文件的问题
+    # 强制设置工作目录为脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
+    os.system('title ARAM 海克斯助手')
     print(f"Working Directory: {script_dir}")
 
     # 1. 初始化核心数据与逻辑
