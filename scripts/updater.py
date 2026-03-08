@@ -12,7 +12,7 @@ from pypinyin import lazy_pinyin
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 import hero_scraper as crawler
-import tier_scraper     # 引入海克斯分级爬虫模块
+
 
 # 2. 解决路径问题
 BASE_DIR = os.path.dirname(current_dir)
@@ -22,8 +22,8 @@ DATA_DIR = os.path.join(BASE_DIR, 'data')
 CHAMPION_ID_FILE = os.path.join(DATA_DIR, "champions.json")
 PINYIN_FILE      = os.path.join(DATA_DIR, "pinyin_map.json")
 CSV_FILE         = os.path.join(DATA_DIR, "hero_augments.csv")
-TIERS_FILE       = os.path.join(DATA_DIR, "tiers.json") 
-CSV_HEADER       =["中文名", "英文名", "全局序号", "等级", "等级内序号", "海克斯名称"]
+
+CSV_HEADER       =["中文名", "英文名", "等级", "等级内序号", "海克斯名称"]
 
 # ================= 1. 数据真理同步 =================
 def sync_official_data():
@@ -108,7 +108,6 @@ def load_csv_history():
                         adapted_row = {
                             "中文名": row.get("中文名", ""),
                             "英文名": en_name,
-                            "全局序号": row.get("序号", 999),
                             "等级": "未知",
                             "等级内序号": 999,
                             "海克斯名称": row.get("海克斯名称", "")
@@ -139,7 +138,6 @@ def merge_and_save(official_en_to_cn, history_data, new_crawl_data):
                 rows_to_write.append({
                     "中文名": cn_name,
                     "英文名": en_name,
-                    "全局序号": item['g_rank'],
                     "等级": item['tier'],
                     "等级内序号": item['t_rank'],
                     "海克斯名称": item['name']
@@ -183,18 +181,10 @@ def main():
     print("   [2] 英雄数据：全量更新 (强制重新爬取所有英雄，耗时较长)")
     print("   [3] 英雄数据：极速补漏 (仅爬取本地无数据的英雄)")
     print("   [4] 英雄数据：精确打击 (手动输入指定英雄名称进行更新)")
-    print("   [5] 全局海克斯：主动拉取最新海克斯分级字典 (Prismatic/Gold/Silver)")
     
     choice = input("\n请输入选项 (默认1): ").strip()
     if not choice:
         choice = '1'
-        
-    # --- 分支 A：执行海克斯分级爬取任务 ---
-    if choice == '5':
-        print("\n>>> 正在执行: 海克斯分级字典更新任务...")
-        tier_scraper.scrape_all_augments(TIERS_FILE)
-        print("\n✅ 任务结束。")
-        return # 执行完分支功能，直接退出脚本
 
     # --- 分支 B：执行英雄海克斯爬取任务 (1, 2, 3, 4) ---
     
@@ -208,13 +198,26 @@ def main():
     elif choice == '3':
         target_list = [(official_en_to_cn[en], en) for en in missing_champs]
     elif choice == '4':
-        user_input = input("请输入要更新的英雄名或英文ID (多个用逗号或空格分隔): ").strip()
+        user_input = input("请输入要更新的英雄名、拼音缩写或英文ID (多个用逗号或空格分隔): ").strip()
         query_names = re.split(r'[,，\s]+', user_input)
+        
+        # 加载拼音映射用于缩写匹配
+        pinyin_data = {}
+        try:
+            if os.path.exists(PINYIN_FILE):
+                with open(PINYIN_FILE, 'r', encoding='utf-8') as f:
+                    pinyin_data = json.load(f)
+        except Exception: 
+            pass
+
         for q in query_names:
             if not q: continue
             matched_en = None
+            q_lower = q.lower()
             for en, cn in official_en_to_cn.items():
-                if q.lower() == en.lower() or q == cn:
+                py_init = pinyin_data.get(cn, "")
+                # 匹配：英文全称 / 中文全称 / 拼音全缩写 (精确匹配)
+                if q_lower == en.lower() or q == cn or q_lower == py_init:
                     matched_en = en
                     break
             if matched_en:
