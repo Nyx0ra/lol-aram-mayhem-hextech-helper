@@ -14,6 +14,7 @@ import keyboard
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from thefuzz import process, fuzz
+from scripts.lcu_connector import LCUConnector
 from rapidocr_onnxruntime import RapidOCR
 
 # ================= 配置与常量 =================
@@ -310,8 +311,11 @@ class OverlayApp:
         self.labels = {}
         self.hide_timer = None
         
+        # 先隐藏窗口，避免配置透明前闪白框
+        self.root.withdraw()
         self._setup_window()
         self._setup_labels()
+        self.root.deiconify()
         
         # 启动队列消息监听
         self.root.after(100, self.process_queue)
@@ -409,11 +413,12 @@ class OverlayApp:
 # ================= 4. 控制逻辑 (Controller) =================
 
 class InputController(threading.Thread):
-    def __init__(self, app_queue, data_manager, analyzer):
+    def __init__(self, app_queue, data_manager, analyzer, lcu_connector=None):
         super().__init__(daemon=True)
         self.queue = app_queue
         self.dm = data_manager
         self.analyzer = analyzer
+        self.lcu = lcu_connector
         self.current_hero = None
 
     def run(self):
@@ -426,26 +431,79 @@ class InputController(threading.Thread):
         while msvcrt.kbhit():
             msvcrt.getch()
 
+    def _validate_hero(self, name):
+        """验证英雄名是否在数据库中，尝试模糊映射"""
+        if name in self.dm.hero_data:
+            return name
+        real_name, score = process.extractOne(name, list(self.dm.hero_data.keys()))
+        if score > 80:
+            return real_name
+        return None
+
+    def _try_auto_detect(self):
+        """使用 LCU 统一接口自动获取英雄，返回 (英雄中文名|None, 来源)"""
+        if not self.lcu:
+            return None, ""
+        hero, source = self.lcu.get_champion_auto()
+        if hero:
+            validated = self._validate_hero(hero)
+            if validated:
+                return validated, source
+        return None, source
+
+    # ==========================================
+    # 阶段1: 选择英雄 (自动轮询 + 手动备用)
+    # ==========================================
+
     def select_hero_phase(self):
         self.queue.put({"cmd": "CLEAR"})
         self.show_console_window()
-        
+
         time.sleep(0.1)
         os.system('cls')
         self.flush_input()
 
-        print("=== ARAM 助手 (F8重新输入) ===")
+        print("=== ARAM Hextech Helper ===")
+        print("    F6=分析 | F7=刷新英雄 | F8=手动输入\n")
+
+        # ====== 尝试自动检测 (轮询最多30秒) ======
+        if self.lcu:
+            print("[Auto] 正在连接英雄联盟客户端...")
+
+            for attempt in range(15):  # 每2秒检测，共30秒
+                hero, source = self._try_auto_detect()
+                if hero:
+                    self.current_hero = hero
+                    print(f"\n>>> 自动识别到英雄: [{hero}] (数据源: {source})")
+                    print(f">>> F6=分析 | F7=刷新 | F8=手动")
+                    self.queue.put({"cmd": "STATUS", "data": f"当前: {hero}\n按 F6 分析 | F7 刷新"})
+                    self.hide_console_window()
+                    return
+
+                # F8 跳过自动检测
+                if keyboard.is_pressed('f8'):
+                    print("\n[F8] 切换至手动输入...")
+                    time.sleep(0.5)
+                    break
+
+                dots = "." * ((attempt % 3) + 1)
+                print(f"\r[Auto] 等待选取英雄{dots}   ", end="", flush=True)
+                time.sleep(2)
+
+            print("\n[Auto] 未能自动识别，回退至手动输入。\n")
+
+        # ====== 手动输入 (备用) ======
         print(">>> 请输入英雄名称 (拼音/中文):")
 
         while True:
             try:
                 self.flush_input()
                 raw = input("Input: ").strip()
-            except EOFError: continue
-            
-            if not raw: continue
-            
-            # 获取匹配列表
+            except EOFError:
+                continue
+            if not raw:
+                continue
+
             matches, is_exact = self.dm.search_hero(raw)
             selected_name = None
 
@@ -453,27 +511,22 @@ class InputController(threading.Thread):
                 print("❌ 未找到，请重试")
                 continue
 
-            # === 处理多个匹配项 ===
             if len(matches) > 1:
                 print(f"🤔 发现多个匹配项，请选择:")
                 for idx, name in enumerate(matches):
                     print(f"   {idx + 1}. {name}")
-                
-                print(">>> 请输入序号 (1, 2...):")
+                print(">>> 请输入序号:")
                 self.flush_input()
                 try:
-                    choice = input("Select: ").strip()
-                    idx = int(choice) - 1
+                    idx = int(input("Select: ").strip()) - 1
                     if 0 <= idx < len(matches):
                         selected_name = matches[idx]
                     else:
-                        print("❌ 序号无效，请重新输入英雄名")
+                        print("无效选项，请重试")
                         continue
                 except ValueError:
-                    print("❌ 输入错误，请重新输入英雄名")
+                    print("无效输入，请重试")
                     continue
-            
-            # === 处理单个匹配项 ===
             else:
                 candidate = matches[0]
                 if is_exact:
@@ -485,46 +538,55 @@ class InputController(threading.Thread):
                         continue
                     selected_name = candidate
 
-            # === 最终锁定逻辑 ===
             if selected_name:
-                if selected_name not in self.dm.hero_data:
-                    real_name, score = process.extractOne(selected_name, list(self.dm.hero_data.keys()))
-                    if score > 80:
-                        print(f"ℹ️ 自动映射: {selected_name} -> {real_name}")
-                        selected_name = real_name
-                    else:
-                        print(f"❌ 数据库暂无【{selected_name}】的数据")
-                        continue
-
-                self.current_hero = selected_name
-                print(f"✅ 锁定: {selected_name}")
-                print(">>> 切回游戏，按 [F6] 分析")
-                
-                self.queue.put({"cmd": "STATUS", "data": f"当前: {selected_name}\n按 F6 分析"})
+                validated = self._validate_hero(selected_name)
+                if not validated:
+                    print(f"数据库暂无【{selected_name}】的数据")
+                    continue
+                self.current_hero = validated
+                print(f">>> 已锁定: {validated}")
+                print(f">>> F6=分析 | F7=刷新 | F8=手动")
+                self.queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n按 F6 分析 | F7 刷新"})
                 self.hide_console_window()
                 break
 
+    # ==========================================
+    # 阶段2: 监听热键
+    # ==========================================
+
     def listening_phase(self):
-        self.flush_input() # 清除确认时的回车键残留
-        
+        self.flush_input()
         is_selecting = False
-        print("(监听中... 按 F8 重置)")
-        
+        print(f"[监听中...] 当前英雄: {self.current_hero} | F6分析 / F7刷新 / F8手动")
+
         while not is_selecting:
             if keyboard.is_pressed('f6'):
-                self.queue.put({"cmd": "STATUS", "data": "🔎 正在分析..."})
-                
-                # 在后台线程执行分析，不阻塞UI
+                self.queue.put({"cmd": "STATUS", "data": f"🔎 正在分析 [{self.current_hero}]..."})
                 results = self.analyzer.analyze(self.current_hero)
-                
                 self.queue.put({"cmd": "UPDATE", "data": results})
-                time.sleep(1) # 防抖
+                time.sleep(1)
+
+            if keyboard.is_pressed('f7'):
+                # F7: 全阶段刷新英雄 (ChampSelect / InProgress / LiveAPI)
+                self.queue.put({"cmd": "STATUS", "data": "刷新英雄..."})
+                hero, source = self._try_auto_detect()
+                if hero and hero != self.current_hero:
+                    old = self.current_hero
+                    self.current_hero = hero
+                    print(f">>> 英雄已切换 ({source}): {old} -> {hero}")
+                    self.queue.put({"cmd": "STATUS", "data": f"已切换: {hero}\n按 F6 分析"})
+                elif hero:
+                    self.queue.put({"cmd": "STATUS", "data": f"当前英雄: {hero}\n按 F6 分析"})
+                else:
+                    self.queue.put({"cmd": "STATUS", "data": f"当前: {self.current_hero}\n按 F6 分析"})
+                time.sleep(1)
 
             if keyboard.is_pressed('f8'):
                 is_selecting = True
-                time.sleep(0.5) # 防止 F8 连击
-            
+                time.sleep(0.5)
+
             time.sleep(0.05)
+
 
     @staticmethod
     def show_console_window():
@@ -538,7 +600,7 @@ class InputController(threading.Thread):
     def hide_console_window():
         try:
             hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-            ctypes.windll.user32.ShowWindow(hwnd, 6) # SW_MINIMIZE
+            ctypes.windll.user32.ShowWindow(hwnd, 0) # SW_HIDE
         except: pass
 
 # ================= 5. 主入口 =================
@@ -546,8 +608,8 @@ class InputController(threading.Thread):
 def main():
     import sys
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
     
     # 强制设置工作目录为脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -566,13 +628,17 @@ def main():
 
     analyzer = GameAnalyzer(dm)
     
-    # 2. 初始化 UI 与 通信队列
+    # 2. 初始化 LCU 客户端连接器
+    champions_json = os.path.join(dm.data_dir, 'champions.json')
+    lcu = LCUConnector(champions_json)
+    
+    # 3. 初始化 UI 与 通信队列
     root = tk.Tk()
     msg_queue = queue.Queue()
     app = OverlayApp(root, msg_queue)
     
-    # 3. 启动后台控制线程
-    controller = InputController(msg_queue, dm, analyzer)
+    # 4. 启动后台控制线程
+    controller = InputController(msg_queue, dm, analyzer, lcu_connector=lcu)
     controller.start()
     
     # 4. 进入 UI 主循环

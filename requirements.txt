@@ -9,3 +9,4 @@ keyboard
 thefuzz
 rapidocr_onnxruntime
 tk
+psutil
