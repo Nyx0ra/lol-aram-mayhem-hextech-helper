@@ -189,37 +189,52 @@ class GameAnalyzer:
 
     def __init__(self, data_manager):
         self.dm = data_manager
-        # OCR 引擎是线程安全的
-        self.ocr = RapidOCR(use_angle_cls=False)
-        # 线程池
+        # OCR 引擎: 降低 det_limit_side_len (默认736→480)
+        # 截取区域 2x 上采样后最大 640px, 480 足以覆盖, 减少检测模型不必要计算
+        self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=480)
+        # 根据 CPU 逻辑核心数决定并发策略
+        self._cpu_count = os.cpu_count() or 4
+        self._use_parallel = self._cpu_count >= 12
         self.executor = ThreadPoolExecutor(max_workers=3)
+        # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
+        self._warmup()
 
-    def capture_region(self, region):
+    def _warmup(self):
+        """用小图预热 OCR 引擎, 消除首次 F6 的冷启动延迟"""
         try:
-            monitor = {
-                "top": int(region["top"]),
-                "left": int(region["left"]),
-                "width": int(region["width"]),
-                "height": int(region["height"]),
-                "mon": 0
-            }
+            dummy = np.zeros((48, 320), dtype=np.uint8)
+            self.ocr(dummy)
+            print(f"OCR 引擎预热完成 (CPU: {self._cpu_count} 线程, {'并发' if self._use_parallel else '串行'}模式)")
+        except Exception:
+            pass
+
+    def capture_all_regions(self):
+        """批量截图: 复用单个 mss 上下文, 避免重复初始化开销"""
+        images = {}
+        try:
             with mss.mss() as sct:
-                raw = sct.grab(monitor)
-            img = Image.frombytes("RGB", raw.size, raw.rgb)
-            gray = img.convert("L")
-            w, h = gray.size
-            # 2倍上采样提高文字清晰度
-            resized = gray.resize((w * 2, h * 2), Image.BICUBIC)
-            return np.array(resized)
+                for key, region in REGIONS.items():
+                    monitor = {
+                        "top": int(region["top"]),
+                        "left": int(region["left"]),
+                        "width": int(region["width"]),
+                        "height": int(region["height"]),
+                        "mon": 0
+                    }
+                    raw = sct.grab(monitor)
+                    img = Image.frombytes("RGB", raw.size, raw.rgb)
+                    gray = img.convert("L")
+                    w, h = gray.size
+                    # 2倍上采样提高文字清晰度
+                    resized = gray.resize((w * 2, h * 2), Image.BICUBIC)
+                    images[key] = np.array(resized)
         except Exception as e:
-            print(f"截图失败: {e}")
-            return None
+            print(f"批量截图失败: {e}")
+        return images
 
-    def _process_single(self, key, hero_cn):
+    def _ocr_and_match(self, key, img, hero_cn):
+        """对单张已截取的图片执行 OCR 识别 + 数据匹配"""
         try:
-            region = REGIONS[key]
-            img = self.capture_region(region)
-            
             if img is None:
                 return {"key": key, "text": "截图错误", "error": True}
 
@@ -279,20 +294,31 @@ class GameAnalyzer:
         if not hero_cn: return {}
         print(f"正在分析: {hero_cn}...")
         
-        futures =[]
-        for key in ["hex_1", "hex_2", "hex_3"]:
-            futures.append(self.executor.submit(self._process_single, key, hero_cn))
+        # 阶段1: 批量截图 (复用 mss 上下文, 总耗时 ~18ms)
+        images = self.capture_all_regions()
         
+        # 阶段2: OCR 识别 + 匹配 (自适应并发策略)
         results = {}
-        valid_matches =[]
-        
-        for f in futures:
-            try:
-                data = f.result()
+        valid_matches = []
+
+        if self._use_parallel:
+            # 高端 CPU (>=12 线程): 并发 OCR, 充分利用多核
+            futures = []
+            for key in images:
+                futures.append(self.executor.submit(self._ocr_and_match, key, images[key], hero_cn))
+            for f in futures:
+                try:
+                    data = f.result()
+                    results[data["key"]] = data
+                    if data.get("valid"): valid_matches.append(data)
+                except Exception as e:
+                    print(f"并发任务异常: {e}")
+        else:
+            # 低端 CPU (<12 线程): 串行 OCR, 避免缓存争抢和线程切换开销
+            for key, img in images.items():
+                data = self._ocr_and_match(key, img, hero_cn)
                 results[data["key"]] = data
                 if data.get("valid"): valid_matches.append(data)
-            except Exception as e:
-                print(f"并发任务异常: {e}")
 
         # 计算最优推荐：总排名优先（越小越好），总排名相同则按等级排序
         if valid_matches:
