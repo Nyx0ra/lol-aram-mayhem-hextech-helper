@@ -7,7 +7,7 @@ opencv-python-headless
 mss
 keyboard
 thefuzz
-rapidocr_onnxruntime
+rapidocr_onnxruntime<=1.4.4  # 需要 Python <3.13
 tk
 psutil
 pystray

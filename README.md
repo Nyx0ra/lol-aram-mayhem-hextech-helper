@@ -1,6 +1,6 @@
 # LOL ARAM Mayhem Hextech Helper (大乱斗海克斯助手)
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.9~3.12-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
@@ -58,6 +58,9 @@
     ```bash
     pip install -r requirements.txt
     ```
+
+> [!WARNING]
+> **Python 版本要求**：本项目依赖的 `rapidocr_onnxruntime` 仅支持 **Python 3.9 ~ 3.12**。使用 Python 3.13+ 会导致 OCR 引擎初始化报错 (`KeyError: 'model_path'`)。请使用 [Python 3.12](https://www.python.org/downloads/release/python-3129/) 或更低版本。
 
 > [!NOTE]
 > **关于客户端路径配置**：

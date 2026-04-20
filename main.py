@@ -191,7 +191,17 @@ class GameAnalyzer:
         self.dm = data_manager
         # OCR 引擎: 降低 det_limit_side_len (默认736→480)
         # 截取区域 2x 上采样后最大 640px, 480 足以覆盖, 减少检测模型不必要计算
-        self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=480)
+        try:
+            self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=480)
+        except (KeyError, TypeError, Exception) as e:
+            py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            print(f"\n❌ OCR 引擎初始化失败: {e}")
+            print(f"   当前 Python 版本: {py_ver}")
+            if sys.version_info >= (3, 13):
+                print(f"   ⚠ rapidocr_onnxruntime 仅支持 Python <3.13，请使用 Python 3.10~3.12")
+            else:
+                print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
+            raise
         # 根据 CPU 逻辑核心数决定并发策略
         self._cpu_count = os.cpu_count() or 4
         self._use_parallel = self._cpu_count >= 12
