@@ -135,8 +135,23 @@ def copy_runtime_files():
     """复制运行时需要的数据文件到 dist 目录"""
     print("\n--- 复制运行时文件 ---")
 
-    # 复制 data/ 目录 (CSV, JSON - 用户可更新)
+    # 先检查旧的 dist/build_*/ARAMHelper/data 下是否有比源码目录更新的数据，避免打包时丢失更新
     src_data = "data"
+    if os.path.exists(src_data):
+        current_build_parent = os.path.abspath(os.path.dirname(DIST_DIR))
+        for old_data_dir in glob.glob(os.path.join("dist", "build_*", APP_NAME, "data")):
+            old_parent = os.path.abspath(os.path.dirname(os.path.dirname(old_data_dir)))
+            if os.path.normcase(old_parent) == os.path.normcase(current_build_parent):
+                continue
+            for fname in ("champions.json", "pinyin_map.json", "hero_augments.csv"):
+                old_file = os.path.join(old_data_dir, fname)
+                repo_file = os.path.join(src_data, fname)
+                if os.path.isfile(old_file):
+                    if not os.path.isfile(repo_file) or os.path.getmtime(old_file) > os.path.getmtime(repo_file):
+                        shutil.copy2(old_file, repo_file)
+                        print(f"🔄 已从旧构建同步较新的数据文件回仓库: {fname}")
+
+    # 复制 data/ 目录 (CSV, JSON - 用户可更新)
     dst_data = os.path.join(DIST_DIR, "data")
     if os.path.exists(src_data):
         if os.path.exists(dst_data):
@@ -255,6 +270,48 @@ def cleanup_bloat():
             print(f"✅ 已清理 numpy 内部 {count} 个 setup 文件")
 
 
+def update_desktop_shortcut():
+    """如果桌面存在 ARAMHelper 快捷方式，自动将其指向最新打包出的可执行文件"""
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    shortcut_path = os.path.join(desktop, "ARAMHelper.exe - 快捷方式.lnk")
+    if not os.path.exists(shortcut_path):
+        return
+
+    target_exe = os.path.abspath(os.path.join(DIST_DIR, f"{APP_NAME}.exe"))
+    working_dir = os.path.abspath(DIST_DIR)
+
+    try:
+        ps_cmd = (
+            f'$sh = New-Object -ComObject WScript.Shell; '
+            f'$sc = $sh.CreateShortcut("{shortcut_path}"); '
+            f'$sc.TargetPath = "{target_exe}"; '
+            f'$sc.WorkingDirectory = "{working_dir}"; '
+            f'$sc.Save()'
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            check=True,
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0,
+        )
+        print(f"\n✅ 已自动更新桌面快捷方式: {shortcut_path} → {target_exe}")
+    except Exception as e:
+        print(f"\n⚠ 更新桌面快捷方式失败: {e}")
+
+
+def cleanup_old_builds():
+    """清理 dist/ 下旧的 build_* 目录，释放磁盘空间"""
+    current_build_dir = os.path.abspath(os.path.dirname(DIST_DIR))
+    for d in glob.glob(os.path.join("dist", "build_*")):
+        abs_d = os.path.abspath(d)
+        if os.path.normcase(abs_d) != os.path.normcase(current_build_dir) and os.path.isdir(abs_d):
+            try:
+                shutil.rmtree(abs_d)
+                print(f"🧹 已清理旧构建目录: {d}")
+            except Exception:
+                pass
+
+
 def print_summary():
     """打印打包结果摘要"""
     print(f"\n{'='*50}")
@@ -293,6 +350,8 @@ def main():
 
     copy_runtime_files()
     cleanup_bloat()
+    update_desktop_shortcut()
+    cleanup_old_builds()
     print_summary()
 
 

@@ -358,7 +358,17 @@ class UpdateDialog:
                  fg=self.TEXT, bg=self.BG).pack(anchor="w", pady=(0, 4))
 
         # ---- 爬虫选项区 ----
-        tk.Label(main, text="🌐 本地爬虫更新 (需要 Chrome 浏览器)",
+        try:
+            from scripts.updater import is_author_environment
+            is_author = is_author_environment()
+        except Exception:
+            is_author = False
+        crawler_label = (
+            "🌐 本地爬虫更新 (需要 Chrome · 更新后自动同步至 GitHub)"
+            if is_author else
+            "🌐 本地爬虫更新 (需要 Chrome 浏览器)"
+        )
+        tk.Label(main, text=crawler_label,
                  font=("Microsoft YaHei", 9), fg=self.WARNING,
                  bg=self.BG).pack(anchor="w", pady=(8, 6))
 

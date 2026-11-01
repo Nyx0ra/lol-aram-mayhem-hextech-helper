@@ -7,12 +7,16 @@ import requests
 import sys
 import re
 import random
+import shutil
+import subprocess
+import time
+import glob
 from pypinyin import lazy_pinyin 
 
 # 1. 解决同级导入问题 (兼容直接运行和包导入)
 try:
     from scripts import hero_scraper as crawler
-    from scripts.config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from scripts.config import BASE_DIR, DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
 except ImportError:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(current_dir)
@@ -21,12 +25,221 @@ except ImportError:
     if current_dir not in sys.path:
         sys.path.insert(0, current_dir)
     import hero_scraper as crawler
-    from config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from config import BASE_DIR, DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
 
 # GitHub 仓库地址 (用于在线下载)
-GITHUB_RAW_BASE  = "https://raw.githubusercontent.com/Nyx0ra/lol-aram-mayhem-hextech-helper/main"
+GITHUB_RAW_BASE    = "https://raw.githubusercontent.com/Nyx0ra/lol-aram-mayhem-hextech-helper/main"
+AUTHOR_GITHUB_USER = "Nyx0ra"
+AUTHOR_REPO_NAME   = "lol-aram-mayhem-hextech-helper"
+AUTHOR_LOCAL_REPO  = r"D:\workspace\1_Projects\Personal\LOL_Tools\lol-aram-mayhem-hextech-helper"
 
 CSV_HEADER       =["中文名", "英文名", "等级", "总排名", "等级内序号", "海克斯名称"]
+
+
+# ================= 0. 作者环境检测与 GitHub 自动同步 =================
+def _find_git_executable():
+    """查找系统中的 git 可执行文件"""
+    git_exe = shutil.which("git")
+    if git_exe:
+        return git_exe
+    for candidate in [
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files\Git\bin\git.exe",
+        r"C:\Program Files (x86)\Git\cmd\git.exe",
+    ]:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _run_git_cmd(args, cwd, timeout=60):
+    """在指定目录静默执行 git 命令 (不弹出黑框、不阻塞交互提示)"""
+    git_exe = _find_git_executable()
+    if not git_exe:
+        return -1, "", "git executable not found"
+
+    safe_dir = os.path.abspath(cwd).replace("\\", "/")
+    cmd = [git_exe, "-c", f"safe.directory={safe_dir}"] + list(args)
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+    try:
+        res = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+            creationflags=creationflags,
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def _find_author_repo_root():
+    """
+    定位本地 Git 仓库根目录。
+    支持从源码目录运行，或从 dist/build_xxx/ARAMHelper/ARAMHelper.exe (桌面快捷方式) 运行。
+    """
+    candidates = []
+    # 1. 从 BASE_DIR 向上回溯最多 6 层 (dist/build_xxx/ARAMHelper -> repo_root 为向上 3 层)
+    curr = os.path.abspath(BASE_DIR)
+    for _ in range(6):
+        candidates.append(curr)
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+
+    # 2. 源码目录本身
+    script_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if script_repo not in candidates:
+        candidates.append(script_repo)
+
+    # 3. 作者本机固定工作区路径兜底
+    if AUTHOR_LOCAL_REPO not in candidates:
+        candidates.append(AUTHOR_LOCAL_REPO)
+
+    for path in candidates:
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, ".git")):
+            return path
+    return None
+
+
+def is_author_environment():
+    """
+    检查当前运行环境是否为作者本人 (Nyx0ra) 的受权仓库环境。
+    非作者环境 (其他用户下载 Release 或普通 clone) 返回 False，使自动上传功能对其他用户完全无感。
+    """
+    repo_root = _find_author_repo_root()
+    if not repo_root:
+        return False
+
+    if not _find_git_executable():
+        return False
+
+    # 校验 git config user.name 是否为作者本人
+    code, user_name, _ = _run_git_cmd(["config", "user.name"], cwd=repo_root, timeout=10)
+    if code != 0 or user_name.lower() != AUTHOR_GITHUB_USER.lower():
+        return False
+
+    # 校验远程 origin 是否指向目标仓库
+    code, remote_url, _ = _run_git_cmd(["remote", "get-url", "origin"], cwd=repo_root, timeout=10)
+    expected_slug = f"{AUTHOR_GITHUB_USER}/{AUTHOR_REPO_NAME}".lower()
+    if code != 0 or expected_slug not in remote_url.lower():
+        return False
+
+    return True
+
+
+def sync_data_to_github(log_func=None, quiet_if_unchanged=False):
+    """
+    在作者本机环境下，自动将最新更新的数据文件同步至本地仓库 data/ 目录并提交推送到 GitHub。
+    对于非作者环境直接静默返回 False，不影响其他用户使用。
+    """
+    if not is_author_environment():
+        return False
+
+    _log = log_func or print
+    repo_root = _find_author_repo_root()
+    if not repo_root:
+        return False
+
+    repo_data_dir = os.path.join(repo_root, "data")
+    data_filenames = ["champions.json", "pinyin_map.json", "hero_augments.csv"]
+
+    try:
+        # 1. 如果当前运行在打包目录 (如 dist/build_xxx/ARAMHelper)，先将最新数据同步回仓库根目录 data/
+        abs_data_dir = os.path.normcase(os.path.abspath(DATA_DIR))
+        abs_repo_data = os.path.normcase(os.path.abspath(repo_data_dir))
+        if abs_data_dir != abs_repo_data:
+            os.makedirs(repo_data_dir, exist_ok=True)
+            for fname in data_filenames:
+                src = os.path.join(DATA_DIR, fname)
+                dst = os.path.join(repo_data_dir, fname)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+        else:
+            # 如果从源码目录运行，也顺便同步给 dist 下现有的打包目录，保持两边数据一致
+            for dist_data in glob.glob(os.path.join(repo_root, "dist", "build_*", "ARAMHelper", "data")):
+                if os.path.isdir(dist_data):
+                    for fname in data_filenames:
+                        src = os.path.join(repo_data_dir, fname)
+                        dst = os.path.join(dist_data, fname)
+                        if os.path.exists(src):
+                            try:
+                                shutil.copy2(src, dst)
+                            except Exception:
+                                pass
+
+        # 2. 检查仓库 data/ 目录下的数据文件是否有变更
+        rel_files = [f"data/{fname}" for fname in data_filenames]
+        code, status_out, err = _run_git_cmd(["status", "--porcelain", "--"] + rel_files, cwd=repo_root)
+        if code != 0:
+            _log(f"⚠ Git 状态检查失败: {err}")
+            return False
+
+        committed_new = False
+        if status_out:
+            _log("🚀 正在将最新数据自动同步至 GitHub 仓库...")
+            code, _, err = _run_git_cmd(["add", "--"] + rel_files, cwd=repo_root)
+            if code != 0:
+                _log(f"❌ Git 暂存数据文件失败: {err}")
+                return False
+
+            # 再次确认暂存区是否存在实质内容变更 (排除仅时间戳变动)
+            code, staged_files, _ = _run_git_cmd(["diff", "--cached", "--name-only", "--"] + rel_files, cwd=repo_root)
+            if staged_files:
+                if "champions.json" in staged_files:
+                    commit_msg = "update: 英雄和海克斯的更新"
+                else:
+                    commit_msg = "Update hero_augments.csv"
+
+                code, commit_out, err = _run_git_cmd(["commit", "-m", commit_msg, "--"] + rel_files, cwd=repo_root)
+                if code != 0:
+                    _log(f"❌ Git 提交数据失败: {err or commit_out}")
+                    return False
+                committed_new = True
+                _log(f"✅ 已生成数据提交: {commit_msg}")
+
+        # 3. 检查是否有需要推送到远程 origin/main 的提交
+        code, ahead_str, _ = _run_git_cmd(["rev-list", "--count", "origin/main..HEAD"], cwd=repo_root)
+        ahead_count = int(ahead_str) if (code == 0 and ahead_str.isdigit()) else 0
+
+        if not committed_new and ahead_count == 0:
+            if not quiet_if_unchanged:
+                _log("ℹ️ GitHub 仓库数据已是最新，无需重复推送")
+            return True
+
+        if not committed_new and ahead_count > 0:
+            _log("🚀 检测到本地有未推送的数据更新，正在同步至 GitHub 仓库...")
+
+        last_err = ""
+        for attempt in range(1, 4):
+            code, _, err = _run_git_cmd(["push", "origin", "main"], cwd=repo_root, timeout=90)
+            if code == 0:
+                _log("✅ 最新数据已成功同步更新至 GitHub 仓库!")
+                return True
+            last_err = err
+            if any(k in err.lower() for k in ("non-fast-forward", "fetch first", "rejected")):
+                _log("🔄 检测到远程仓库有新提交，正在自动拉取合并后重试...")
+                _run_git_cmd(["pull", "--rebase", "--autostash", "origin", "main"], cwd=repo_root, timeout=60)
+            elif attempt < 3:
+                _log(f"⚠ 推送 GitHub 失败，正在重试 ({attempt}/3)...")
+                time.sleep(2)
+
+        _log(f"❌ 推送至 GitHub 仓库失败: {last_err}")
+        return False
+
+    except Exception as e:
+        _log(f"❌ 同步至 GitHub 仓库异常: {e}")
+        return False
 
 # ================= 1. 数据真理同步 =================
 def sync_official_data():
@@ -180,9 +393,11 @@ def merge_and_save(official_en_to_cn, history_data, new_crawl_data):
         print(f"✅ 写入完成！主文件: {CSV_FILE} (共 {len(final_rows)} 条数据)")
     except Exception as e:
         print(f"❌ 写入主文件失败: {e}")
+        return False
         
     if missing_data_champions:
         print(f"\n⚠️ 注意: 有 {len(missing_data_champions)} 个英雄完全没有任何数据: {', '.join(missing_data_champions)}")
+    return True
 
 # ================= 5. 抽样比对检查 =================
 def compare_hero_data(history_rows, crawled_items):
@@ -330,34 +545,58 @@ def run_update(mode='smart', log_func=None, official_data=None):
         elif mode == 'spot_check':
             _log("模式: 抽样校验")
             has_diff, sample_data = spot_check_and_update(official_en_to_cn, history_data)
+            if not sample_data and official_en_to_cn:
+                _log("❌ 抽样校验失败: 未能成功抓取任何抽样英雄数据，请检查网络")
+                return False
             if has_diff:
                 _log("🔄 检测到数据差异，触发全量更新...")
-                target_list = [(cn, en) for en, cn in official_en_to_cn.items()]
+                new_crawl_data.update(sample_data)
+                target_list = [(cn, en) for en, cn in official_en_to_cn.items() if cn not in sample_data]
+            elif new_champs or renamed_champs or missing_champs:
+                _log("🔄 抽样英雄一致，但检测到新增/改名/缺失英雄，触发增量补全...")
+                new_crawl_data.update(sample_data)
+                targets = set(new_champs + renamed_champs + missing_champs)
+                target_list = [(official_en_to_cn[en], en) for en in targets if official_en_to_cn[en] not in sample_data]
             else:
                 _log("✅ 抽样数据与本地一致，无需更新")
+                sync_data_to_github(log_func=_log, quiet_if_unchanged=True)
                 return True
         
         elif mode == 'patch':
             _log("模式: 极速补漏")
             target_list = [(official_en_to_cn[en], en) for en in missing_champs]
+            if not target_list:
+                _log("✅ 本地无缺失数据的英雄，无需补漏")
+                sync_data_to_github(log_func=_log, quiet_if_unchanged=True)
+                return True
         
         else:  # smart
             _log("模式: 智能增量")
             targets = set(new_champs + renamed_champs + missing_champs)
             target_list = [(official_en_to_cn[en], en) for en in targets]
+            if not target_list:
+                _log("✅ 未发现新英雄、改名英雄或缺失数据，无需更新")
+                sync_data_to_github(log_func=_log, quiet_if_unchanged=True)
+                return True
         
         # 4. 执行爬取
         if target_list:
             _log(f"准备爬取 {len(target_list)} 个英雄...")
-            new_crawl_data, failed_list = crawler.crawl_champions(target_list)
+            crawled_data, failed_list = crawler.crawl_champions(target_list)
+            new_crawl_data.update(crawled_data)
             if failed_list:
                 _log(f"⚠ 爬取失败的英雄: {', '.join(failed_list)}")
+            if not new_crawl_data:
+                _log("❌ 所有目标英雄爬取均失败，未更新数据")
+                return False
         elif not new_crawl_data:
             _log("无需爬取")
         
         # 5. 合并保存
-        merge_and_save(official_en_to_cn, history_data, new_crawl_data)
+        if not merge_and_save(official_en_to_cn, history_data, new_crawl_data):
+            return False
         _log("✅ 数据合并保存完成")
+        sync_data_to_github(log_func=_log, quiet_if_unchanged=False)
         return True
         
     except Exception as e:
@@ -474,8 +713,14 @@ def update_specific_heroes(hero_names, log_func=None):
         if failed_list:
             _log(f"⚠ 爬取失败: {', '.join(failed_list)}")
         
-        merge_and_save(official_en_to_cn, history_data, new_crawl_data)
+        if not new_crawl_data:
+            _log("❌ 指定英雄爬取失败，未更新数据")
+            return False
+
+        if not merge_and_save(official_en_to_cn, history_data, new_crawl_data):
+            return False
         _log("✅ 精确更新完成")
+        sync_data_to_github(log_func=_log, quiet_if_unchanged=False)
         return True
         
     except Exception as e:
