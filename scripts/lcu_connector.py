@@ -39,8 +39,8 @@ COMMON_INSTALL_PATHS = [
 class LCUConnector:
     """英雄联盟客户端 LCU API 连接器（全生命周期）"""
 
-    LCU_TIMEOUT = 3       # LCU API 请求超时 (秒)
-    LIVE_API_TIMEOUT = 2  # Live Client Data API 超时 (秒)
+    LCU_TIMEOUT = 2.0       # LCU API 请求超时 (秒)
+    LIVE_API_TIMEOUT = 1.0  # Live Client Data API 超时 (秒)
 
     def __init__(self, champions_json_path):
         self.port = None
@@ -48,6 +48,10 @@ class LCUConnector:
         self.base_url = None
         self._connected = False
         self._summoner_id = None  # 缓存当前召唤师ID
+
+        # HTTP 连接池会话复用
+        self.lcu_session = requests.Session()
+        self.live_session = requests.Session()
 
         # 加载 champions.json: 中文名 -> 英文名
         self.cn_to_en = {}
@@ -57,6 +61,41 @@ class LCUConnector:
 
         # 英雄 ID -> 中文名映射 (连接后构建)
         self.id_to_cn = {}
+
+    def _resolve_champion_name(self, raw_name):
+        """
+        灵活解析各类英雄名表达为标准中文名:
+        - 已经是中文名 (如 "暗裔剑魔")
+        - 英文别名/名称 (如 "Aatrox", "MonkeyKing", "DrMundo")
+        - 客户端带前缀键名 (如 "game_character_displayname_Ezreal")
+        """
+        if not raw_name or not isinstance(raw_name, str):
+            return None
+        cleaned = raw_name.strip()
+        if not cleaned:
+            return None
+
+        # 1. 直接命中中文名
+        if cleaned in self.cn_to_en:
+            return cleaned
+
+        # 2. 剥离 "game_character_displayname_" 前缀
+        if cleaned.startswith("game_character_displayname_"):
+            cleaned = cleaned.replace("game_character_displayname_", "").strip()
+            if cleaned in self.cn_to_en:
+                return cleaned
+
+        # 3. 英文名小写匹配
+        lower_name = cleaned.lower()
+        if lower_name in self.en_to_cn:
+            return self.en_to_cn[lower_name]
+
+        # 4. 去除空格/下划线后匹配
+        no_space = lower_name.replace(" ", "").replace("_", "").replace("'", "")
+        if no_space in self.en_to_cn:
+            return self.en_to_cn[no_space]
+
+        return None
 
     def _load_champions_map(self, path):
         """加载 champions.json 构建中英文映射"""
@@ -140,13 +179,13 @@ class LCUConnector:
         if not self.base_url or not self.auth_token:
             return None
         try:
-            resp = requests.request(
+            resp = self.lcu_session.request(
                 method, f"{self.base_url}{endpoint}",
                 auth=('riot', self.auth_token),
                 verify=False, timeout=self.LCU_TIMEOUT, **kwargs
             )
             return resp
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             self._connected = False
             return None
         except Exception:
@@ -269,75 +308,151 @@ class LCUConnector:
             pass
         return None
 
-    def get_ingame_champion(self):
+    def get_live_game_info(self):
         """
-        通过 Live Client Data API 获取游戏内英雄 (端口 2999, 免密)。
-        仅在游戏进行中（Loading 结束后）可用。
+        从 Live Client Data API (端口 2999) 获取局内全面信息。
+        返回 dict 或 None:
+        {
+            "in_game": bool,
+            "champion": str,
+            "game_mode": str,
+            "game_time": float,
+            "level": int,
+            "is_dead": bool
+        }
         """
         try:
-            resp = requests.get(
-                'https://127.0.0.1:2999/liveclientdata/activeplayer',
+            resp = self.live_session.get(
+                'https://127.0.0.1:2999/liveclientdata/allgamedata',
                 verify=False, timeout=self.LIVE_API_TIMEOUT
             )
             if resp.status_code == 200:
-                en_name = resp.json().get('championName', '')
-                if en_name:
-                    cn = self.en_to_cn.get(en_name.lower())
-                    if not cn:
-                        cn = self.en_to_cn.get(en_name.replace(' ', '').lower())
-                    return cn
-        except requests.exceptions.ConnectionError:
+                data = resp.json()
+                active = data.get('activePlayer', {})
+                all_players = data.get('allPlayers', [])
+                game_data = data.get('gameData', {})
+
+                # 提取局内英雄
+                champion = None
+                raw_active_champ = active.get('championName', '')
+                if raw_active_champ:
+                    champion = self._resolve_champion_name(raw_active_champ)
+
+                # 如果 activePlayer 未直接提取到，通过 riotId/summonerName 在 allPlayers 中匹配
+                active_riot_id = active.get('riotId', '') or active.get('summonerName', '')
+                is_dead = False
+                level = active.get('level', 1)
+
+                if all_players:
+                    for p in all_players:
+                        p_riot = p.get('riotId', '') or p.get('summonerName', '')
+                        if (active_riot_id and p_riot and active_riot_id == p_riot) or (len(all_players) == 1):
+                            if not champion:
+                                candidate = p.get('championName') or p.get('rawChampionName')
+                                champion = self._resolve_champion_name(candidate)
+                            is_dead = bool(p.get('isDead', False))
+                            if 'level' in p:
+                                level = p.get('level', level)
+                            break
+
+                return {
+                    "in_game": True,
+                    "champion": champion,
+                    "game_mode": game_data.get('gameMode', ''),
+                    "game_time": float(game_data.get('gameTime', 0.0)),
+                    "level": int(level),
+                    "is_dead": is_dead
+                }
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             pass
         except Exception:
             pass
         return None
 
+    def get_ingame_champion(self):
+        """
+        通过 Live Client Data API 获取游戏内英雄 (端口 2999, 免密)。
+        仅在游戏进行中（Loading 结束后）可用。
+        """
+        # 1. 优先请求快速轻量的 activeplayer
+        try:
+            resp = self.live_session.get(
+                'https://127.0.0.1:2999/liveclientdata/activeplayer',
+                verify=False, timeout=self.LIVE_API_TIMEOUT
+            )
+            if resp.status_code == 200:
+                raw_champ = resp.json().get('championName', '')
+                cn = self._resolve_champion_name(raw_champ)
+                if cn:
+                    return cn
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            return None
+        except Exception:
+            pass
+
+        # 2. 备选: 调用 get_live_game_info 读取 allgamedata
+        info = self.get_live_game_info()
+        if info and info.get("champion"):
+            return info["champion"]
+
+        return None
+
     # ==========================================
-    # 统一接口: 自动检测英雄 (全阶段)
+    # 统一接口: 自动检测英雄与阶段 (全阶段)
     # ==========================================
+
+    def get_session_state(self):
+        """
+        获取当前客户端会话的全局状态。
+        Returns:
+            (phase: str, hero: str | None, source: str, details: dict | None)
+        """
+        # 1. 如果 LCU 未连接，先尝试连接
+        if not self._connected:
+            self.connect()
+
+        # 2. 如果 LCU 已连接，优先从 LCU 获取阶段
+        if self._connected:
+            phase = self.get_gameflow_phase() or "Unknown"
+
+            if phase == "ChampSelect":
+                hero = self.get_champ_select_champion()
+                return (phase, hero, "ChampSelect", None)
+
+            if phase in ("InProgress", "GameStart"):
+                hero = self.get_gameflow_champion()
+                if hero:
+                    return (phase, hero, "GameFlow", None)
+                # 备选: Live Client Data API
+                live_info = self.get_live_game_info()
+                if live_info and live_info.get("champion"):
+                    return (phase, live_info["champion"], "Live API", live_info)
+                return (phase, None, "GameFlow", None)
+
+            # 大厅或其他非对局阶段
+            if phase in ("None", "Lobby", "Matchmaking", "EndOfGame", "WaitingForStats"):
+                return (phase, None, phase, None)
+
+            # 其他特殊阶段尝试读取
+            hero = self.get_champ_select_champion()
+            if hero:
+                return (phase, hero, "ChampSelect", None)
+            return (phase, None, phase, None)
+
+        # 3. 若 LCU 无法连上 (如只有游戏进程或权限受阻)，直接探测 2999 端口
+        live_info = self.get_live_game_info()
+        if live_info and live_info.get("in_game"):
+            return ("InProgress", live_info.get("champion"), "Live API", live_info)
+
+        return ("Disconnected", None, "", None)
 
     def get_champion_auto(self):
         """
-        全生命周期自动获取当前英雄。
-
-        按优先级依次尝试:
-          1. ChampSelect  -> /lol-champ-select/v1/session
-          2. InProgress   -> /lol-gameflow/v1/session (gameData)
-          3. Live API     -> 127.0.0.1:2999 (免密, 游戏内)
-
+        全生命周期自动获取当前英雄 (向后兼容)。
         Returns:
             (str | None, str): (英雄中文名, 数据来源)
         """
-        # 确保连接
-        if not self._connected:
-            if not self.connect():
-                # LCU 不可用，只尝试 Live API
-                hero = self.get_ingame_champion()
-                return (hero, "Live API") if hero else (None, "")
-
-        # 获取当前阶段
-        phase = self.get_gameflow_phase()
-
-        # 策略1: ChampSelect 阶段
-        if phase == "ChampSelect":
-            hero = self.get_champ_select_champion()
-            if hero:
-                return hero, "ChampSelect"
-
-        # 策略2: InProgress / GameStart 阶段
-        if phase in ("InProgress", "GameStart"):
-            hero = self.get_gameflow_champion()
-            if hero:
-                return hero, "GameFlow"
-            # 备选: Live Client Data API
-            hero = self.get_ingame_champion()
-            if hero:
-                return hero, "Live API"
-
-        # 策略3: 其他阶段也尝试 champ-select (以防 phase 查询延迟)
-        if phase not in ("None", "Lobby", "Matchmaking", "EndOfGame", "WaitingForStats"):
-            hero = self.get_champ_select_champion()
-            if hero:
-                return hero, "ChampSelect"
+        _, hero, source, _ = self.get_session_state()
+        return hero, source
 
         return None, phase or ""
