@@ -1,7 +1,7 @@
 """
 ARAM 海克斯助手 - 一键打包脚本
 运行: python build.py
-输出: dist/ARAMHelper/
+输出: dist/build_<timestamp>/ARAMHelper/ARAMHelper.exe
 """
 import subprocess
 import shutil
@@ -9,6 +9,9 @@ import os
 import sys
 import time
 import glob
+import re
+import stat
+from pathlib import Path
 
 
 APP_NAME = "ARAMHelper"
@@ -299,17 +302,46 @@ def update_desktop_shortcut():
         print(f"\n⚠ 更新桌面快捷方式失败: {e}")
 
 
+def _is_local_directory(path):
+    """拒绝符号链接和 Windows 目录联接，避免清理到 dist 之外。"""
+    info = path.lstat()
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return stat.S_ISDIR(info.st_mode) and not reparse and path.resolve() == path
+
+
 def cleanup_old_builds():
-    """清理 dist/ 下旧的 build_* 目录，释放磁盘空间"""
-    current_build_dir = os.path.abspath(os.path.dirname(DIST_DIR))
-    for d in glob.glob(os.path.join("dist", "build_*")):
-        abs_d = os.path.abspath(d)
-        if os.path.normcase(abs_d) != os.path.normcase(current_build_dir) and os.path.isdir(abs_d):
-            try:
-                shutil.rmtree(abs_d)
-                print(f"🧹 已清理旧构建目录: {d}")
-            except Exception:
-                pass
+    """删除旧的单目录产物，保留用户另外放在 dist 中的文件。"""
+    dist_root = Path.cwd().resolve() / "dist"
+    if not _is_local_directory(dist_root):
+        print(f"⚠ 跳过旧构建清理，dist 不是本地普通目录: {dist_root}")
+        return
+    current_build_dir = Path(DIST_DIR).resolve().parent
+    current = re.fullmatch(r"build_(\d+)", current_build_dir.name)
+    if current_build_dir.parent != dist_root or current is None:
+        print(f"⚠ 跳过旧构建清理，当前构建不在预期目录: {current_build_dir}")
+        return
+    for candidate in dist_root.iterdir():
+        legacy = candidate.name == APP_NAME
+        generated = re.fullmatch(r"build_(\d+)", candidate.name)
+        if not legacy and (generated is None or int(generated[1]) >= int(current[1])):
+            continue
+        try:
+            if not _is_local_directory(candidate):
+                print(f"⚠ 跳过非普通构建目录: {candidate}")
+                continue
+            product = candidate if legacy else candidate / APP_NAME
+            if legacy and not (product / f"{APP_NAME}.exe").is_file():
+                continue
+            if product.exists() or product.is_symlink():
+                if not _is_local_directory(product):
+                    print(f"⚠ 跳过非普通产物目录: {product}")
+                    continue
+                shutil.rmtree(product)
+                print(f"🧹 已清理旧构建: {product}")
+            if not legacy and not any(candidate.iterdir()):
+                candidate.rmdir()
+        except OSError as error:
+            print(f"⚠ 旧构建未完全清理，下次构建会重试: {candidate} ({error})")
 
 
 def print_summary():
@@ -317,8 +349,9 @@ def print_summary():
     print(f"\n{'='*50}")
     print(f"  ✅ 打包完成!")
     print(f"{'='*50}")
-    print(f"\n  输出目录: {os.path.abspath(DIST_DIR)}")
-    print(f"  可执行文件: {os.path.join(DIST_DIR, APP_NAME + '.exe')}")
+    exe_path = Path(DIST_DIR).resolve() / f"{APP_NAME}.exe"
+    print(f"\n  EXE: {exe_path}")
+    print(f'  PowerShell 启动: & "{exe_path}"')
 
     # 计算目录大小
     total_size = 0
@@ -328,9 +361,6 @@ def print_summary():
             total_size += os.path.getsize(fp)
     size_mb = total_size / (1024 * 1024)
     print(f"  总大小: {size_mb:.1f} MB")
-
-    print(f"\n  分发方式: 将 {DIST_DIR}/ 整个文件夹打成 ZIP 发给用户")
-    print(f"  用户使用: 解压后双击 {APP_NAME}.exe 即可运行\n")
 
 
 def main():
@@ -343,17 +373,21 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
 
     if not check_dependencies():
-        return
+        return 1
 
     if not build():
-        return
+        return 1
 
     copy_runtime_files()
     cleanup_bloat()
+    if not (Path(DIST_DIR) / f"{APP_NAME}.exe").is_file():
+        print("❌ 构建未生成 EXE，跳过旧构建清理")
+        return 1
     update_desktop_shortcut()
     cleanup_old_builds()
     print_summary()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -11,6 +11,9 @@ import shutil
 import subprocess
 import time
 import glob
+import io
+from pathlib import Path
+import tempfile
 from pypinyin import lazy_pinyin 
 
 # 1. 解决同级导入问题 (兼容直接运行和包导入)
@@ -34,6 +37,85 @@ AUTHOR_REPO_NAME   = "lol-aram-mayhem-hextech-helper"
 AUTHOR_LOCAL_REPO  = r"D:\workspace\1_Projects\Personal\LOL_Tools\lol-aram-mayhem-hextech-helper"
 
 CSV_HEADER       =["中文名", "英文名", "等级", "总排名", "等级内序号", "海克斯名称"]
+REQUEST_TIMEOUT = (5, 15)
+
+
+def _json_bytes(mapping):
+    return json.dumps(mapping, indent=4, ensure_ascii=False).encode("utf-8")
+
+
+def _validate_dataset(csv_bytes, champions_bytes, pinyin_bytes):
+    champions = json.loads(champions_bytes.decode("utf-8-sig"))
+    pinyin = json.loads(pinyin_bytes.decode("utf-8-sig"))
+    for mapping in (champions, pinyin):
+        if not isinstance(mapping, dict) or not mapping or not all(
+            name.strip() and isinstance(value, str) and value.strip()
+            for name, value in mapping.items()
+        ):
+            raise ValueError("英雄映射或拼音索引格式无效")
+    if champions.keys() != pinyin.keys() or len(set(champions.values())) != len(champions):
+        raise ValueError("英雄映射与拼音索引不一致")
+
+    reader = csv.reader(io.StringIO(csv_bytes.decode("utf-8-sig")), strict=True)
+    if next(reader, None) != CSV_HEADER:
+        raise ValueError("海克斯 CSV 表头不匹配")
+    rows = 0
+    for row in reader:
+        if len(row) != len(CSV_HEADER):
+            raise ValueError(f"海克斯 CSV 第 {reader.line_num} 行列数不匹配")
+        cn, en, tier, rank, tier_rank, name = row
+        if (champions.get(cn) != en or tier not in {"白银", "黄金", "棱彩", "未知"}
+                or not name.strip() or int(rank) < 1 or int(tier_rank) < 1):
+            raise ValueError(f"海克斯 CSV 第 {reader.line_num} 行内容无效")
+        rows += 1
+    if not rows:
+        raise ValueError("海克斯 CSV 没有数据")
+
+
+def _replace_files(files):
+    """先在目标盘准备新文件和备份，再逐个替换。失败时恢复已替换的文件。"""
+    parent = Path(next(iter(files))).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".data-update-", dir=parent))
+    replaced = []
+    keep_backup = False
+    try:
+        prepared = []
+        for index, (path, content) in enumerate(files.items()):
+            target = Path(path)
+            pending = stage / f"{index}.new"
+            pending.write_bytes(content)
+            backup = None
+            if target.exists():
+                backup = stage / f"{index}.{target.name}.bak"
+                shutil.copy2(target, backup)
+            prepared.append((target, pending, backup))
+
+        for target, pending, backup in prepared:
+            os.replace(pending, target)
+            replaced.append((target, backup))
+    except OSError as error:
+        rollback_errors = []
+        for target, backup in reversed(replaced):
+            try:
+                if backup is None:
+                    target.unlink()
+                else:
+                    os.replace(backup, target)
+            except OSError as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        if rollback_errors:
+            keep_backup = True
+            raise OSError(f"更新失败且无法完整回滚，备份位于 {stage}: {rollback_errors}") from error
+        raise
+    finally:
+        if not keep_backup:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def _save_dataset(csv_bytes, champions_bytes, pinyin_bytes):
+    _validate_dataset(csv_bytes, champions_bytes, pinyin_bytes)
+    _replace_files({CSV_FILE: csv_bytes, CHAMPION_ID_FILE: champions_bytes, PINYIN_FILE: pinyin_bytes})
 
 
 # ================= 0. 作者环境检测与 GitHub 自动同步 =================
@@ -246,11 +328,15 @@ def sync_official_data():
     print(">>> [1/4] 正在同步官方英雄数据...")
     try:
         ver_url = "https://ddragon.leagueoflegends.com/api/versions.json"
-        version = requests.get(ver_url).json()[0]
+        response = requests.get(ver_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        version = response.json()[0]
         print(f"    当前游戏版本: {version}")
 
         champ_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/zh_CN/champion.json"
-        data = requests.get(champ_url).json()['data']
+        response = requests.get(champ_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()['data']
 
         official_en_to_cn = {}
         official_cn_to_en = {}
@@ -267,9 +353,6 @@ def sync_official_data():
                 old_cn_to_en = json.load(f)
                 old_en_to_cn = {en: cn for cn, en in old_cn_to_en.items()}
 
-        with open(CHAMPION_ID_FILE, 'w', encoding='utf-8') as f:
-            json.dump(official_cn_to_en, f, indent=4, ensure_ascii=False)
-        
         new_champs = []
         renamed_champs =[]
         
@@ -292,16 +375,22 @@ def sync_official_data():
         return {}, {}, [],[]
 
 # ================= 2. 拼音生成 =================
-def update_pinyin_file(official_cn_to_en):
-    print(">>>[2/4] 更新拼音检索文件...")
+def _pinyin_mapping(official_cn_to_en):
     pinyin_data = {}
     for cn_name in official_cn_to_en.keys():
         pinyin_list = lazy_pinyin(cn_name)
         initials = "".join([p[0].lower() for p in pinyin_list if p])
         pinyin_data[cn_name] = initials
-    
-    with open(PINYIN_FILE, 'w', encoding='utf-8') as f:
-        json.dump(pinyin_data, f, indent=4, ensure_ascii=False)
+    return pinyin_data
+
+
+def update_pinyin_file(official_cn_to_en):
+    if not isinstance(official_cn_to_en, dict) or not official_cn_to_en or not all(
+        name.strip() and isinstance(alias, str) and alias.strip()
+        for name, alias in official_cn_to_en.items()
+    ):
+        raise ValueError("英雄映射格式无效")
+    _replace_files({PINYIN_FILE: _json_bytes(_pinyin_mapping(official_cn_to_en))})
     print("    拼音文件已更新。")
 
 # ================= 3. 数据保护逻辑 (读CSV) =================
@@ -313,7 +402,9 @@ def load_csv_history():
 
     try:
         with open(CSV_FILE, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f, strict=True)
+            if not reader.fieldnames or not {"中文名", "英文名", "海克斯名称"}.issubset(reader.fieldnames):
+                raise ValueError("历史 CSV 缺少必要列")
             is_old_format = reader.fieldnames and "序号" in reader.fieldnames and "等级" not in reader.fieldnames
             has_overall_rank = reader.fieldnames and "总排名" in reader.fieldnames
             
@@ -347,8 +438,8 @@ def load_csv_history():
                     else:
                         history[en_name].append(row)
         print(f"    已加载 {len(history)} 个英雄的历史数据。")
-    except Exception as e:
-        print(f"⚠️ 读取历史CSV时出错 (可能是空文件): {e}")
+    except (OSError, ValueError, csv.Error) as e:
+        raise ValueError(f"无法读取历史 CSV: {e}") from e
     
     return history
 
@@ -364,7 +455,7 @@ def merge_and_save(official_en_to_cn, history_data, new_crawl_data):
     for en_name, cn_name in official_en_to_cn.items():
         rows_to_write =[]
 
-        if en_name in crawl_by_en:
+        if crawl_by_en.get(en_name):
             for item in crawl_by_en[en_name]:
                 rows_to_write.append({
                     "中文名": cn_name,
@@ -386,10 +477,15 @@ def merge_and_save(official_en_to_cn, history_data, new_crawl_data):
             final_rows.extend(rows_to_write)
 
     try:
-        with open(CSV_FILE, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-            writer.writeheader()
-            writer.writerows(final_rows)
+        output = io.StringIO(newline='')
+        writer = csv.DictWriter(output, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        writer.writerows(final_rows)
+        _save_dataset(
+            output.getvalue().encode("utf-8-sig"),
+            _json_bytes(official_cn_to_en),
+            _json_bytes(_pinyin_mapping(official_cn_to_en)),
+        )
         print(f"✅ 写入完成！主文件: {CSV_FILE} (共 {len(final_rows)} 条数据)")
     except Exception as e:
         print(f"❌ 写入主文件失败: {e}")
@@ -468,8 +564,6 @@ def main():
     if not official_en_to_cn:
         return
 
-    update_pinyin_file(official_cn_to_en)
-
     # 2. 核心菜单选择
     print("\n请选择要执行的任务:")
     print("   [1] 英雄数据：智能增量 (自动爬取: 全新英雄 + 改名英雄 + 本地无数据的英雄)")
@@ -528,8 +622,6 @@ def run_update(mode='smart', log_func=None, official_data=None):
                 _log("❌ 官方数据同步失败")
                 return False
             _log(f"✅ 同步完成: {len(official_en_to_cn)} 个英雄")
-            update_pinyin_file(official_cn_to_en)
-            _log("✅ 拼音文件已更新")
         
         # 2. 加载历史数据
         history_data = load_csv_history()
@@ -559,16 +651,12 @@ def run_update(mode='smart', log_func=None, official_data=None):
                 target_list = [(official_en_to_cn[en], en) for en in targets if official_en_to_cn[en] not in sample_data]
             else:
                 _log("✅ 抽样数据与本地一致，无需更新")
-                sync_data_to_github(log_func=_log, quiet_if_unchanged=True)
-                return True
         
         elif mode == 'patch':
             _log("模式: 极速补漏")
             target_list = [(official_en_to_cn[en], en) for en in missing_champs]
             if not target_list:
                 _log("✅ 本地无缺失数据的英雄，无需补漏")
-                sync_data_to_github(log_func=_log, quiet_if_unchanged=True)
-                return True
         
         else:  # smart
             _log("模式: 智能增量")
@@ -576,8 +664,6 @@ def run_update(mode='smart', log_func=None, official_data=None):
             target_list = [(official_en_to_cn[en], en) for en in targets]
             if not target_list:
                 _log("✅ 未发现新英雄、改名英雄或缺失数据，无需更新")
-                sync_data_to_github(log_func=_log, quiet_if_unchanged=True)
-                return True
         
         # 4. 执行爬取
         if target_list:
@@ -617,32 +703,27 @@ def download_from_github(log_func=None):
     _log = log_func or print
     
     files_to_download = [
-        ("data/hero_augments.csv", CSV_FILE, "英雄海克斯数据"),
-        ("data/champions.json", CHAMPION_ID_FILE, "英雄名称映射"),
-        ("data/pinyin_map.json", PINYIN_FILE, "拼音检索索引"),
+        ("data/hero_augments.csv", "英雄海克斯数据"),
+        ("data/champions.json", "英雄名称映射"),
+        ("data/pinyin_map.json", "拼音检索索引"),
     ]
     
-    success_count = 0
     total = len(files_to_download)
+    contents = []
     
-    for idx, (remote_path, local_path, desc) in enumerate(files_to_download, 1):
-        url = f"{GITHUB_RAW_BASE}/{remote_path}"
-        _log(f"下载中 [{idx}/{total}]: {desc}...")
-        try:
-            resp = requests.get(url, timeout=30)
-            if resp.status_code == 200:
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                with open(local_path, 'wb') as f:
-                    f.write(resp.content)
-                _log(f"✅ {desc} 下载成功 ({len(resp.content)} bytes)")
-                success_count += 1
-            else:
-                _log(f"❌ {desc} 下载失败 (HTTP {resp.status_code})")
-        except Exception as e:
-            _log(f"❌ {desc} 下载异常: {e}")
-    
-    _log(f"下载完成: {success_count}/{total} 成功")
-    return success_count == total
+    try:
+        for idx, (remote_path, desc) in enumerate(files_to_download, 1):
+            _log(f"下载中 [{idx}/{total}]: {desc}...")
+            resp = requests.get(f"{GITHUB_RAW_BASE}/{remote_path}", timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                raise ValueError(f"{desc} 下载失败 (HTTP {resp.status_code})")
+            contents.append(resp.content)
+        _save_dataset(*contents)
+    except Exception as e:
+        _log(f"❌ 下载更新失败: {e}")
+        return False
+    _log("✅ 三份数据已校验并保存")
+    return True
 
 
 def update_specific_heroes(hero_names, log_func=None):

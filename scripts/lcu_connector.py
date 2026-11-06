@@ -11,6 +11,8 @@ LCU Connector - 英雄联盟客户端本地 API 连接器
 """
 import json
 import os
+import threading
+import time
 
 import psutil
 import requests
@@ -54,6 +56,7 @@ class LCUConnector:
         self.live_session = requests.Session()
 
         # 加载 champions.json: 中文名 -> 英文名
+        self.champions_json_path = champions_json_path
         self.cn_to_en = {}
         # 反向映射: 英文名(小写) -> 中文名
         self.en_to_cn = {}
@@ -104,12 +107,24 @@ class LCUConnector:
             return
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                self.cn_to_en = json.load(f)
-            for cn, en in self.cn_to_en.items():
-                self.en_to_cn[en.lower()] = cn
+                mapping = json.load(f)
+            reverse = {en.lower(): cn for cn, en in mapping.items()}
+            self.cn_to_en, self.en_to_cn = mapping, reverse
             print(f"   [OK] heroes loaded: {len(self.cn_to_en)}")
         except Exception as e:
             print(f"   [WARN] champions.json error: {e}")
+
+    def reload_champions(self):
+        previous = self.cn_to_en
+        self._load_champions_map(self.champions_json_path)
+        if previous != self.cn_to_en:
+            self.id_to_cn = {
+                cid: self.en_to_cn[previous[name].lower()]
+                for cid, name in self.id_to_cn.items()
+                if name in previous and previous[name].lower() in self.en_to_cn
+            }
+            if self._connected:
+                self._build_champion_id_map()
 
     # ==========================================
     # 连接方法
@@ -401,9 +416,9 @@ class LCUConnector:
     # 统一接口: 自动检测英雄与阶段 (全阶段)
     # ==========================================
 
-    def get_session_state(self):
+    def get_session_state(self, on_phase=None):
         """
-        获取当前客户端会话的全局状态。
+        获取当前客户端会话的全局状态。on_phase 可在已知进入对局时先通知调用方。
         Returns:
             (phase: str, hero: str | None, source: str, details: dict | None)
         """
@@ -414,6 +429,8 @@ class LCUConnector:
         # 2. 如果 LCU 已连接，优先从 LCU 获取阶段
         if self._connected:
             phase = self.get_gameflow_phase() or "Unknown"
+            if on_phase is not None and phase == "InProgress":
+                on_phase(phase)
 
             if phase == "ChampSelect":
                 hero = self.get_champ_select_champion()
@@ -456,3 +473,46 @@ class LCUConnector:
         return hero, source
 
         return None, phase or ""
+
+
+class SessionPoller(threading.Thread):
+    """Own the connector while running. Readers only inspect an immutable tuple."""
+
+    def __init__(self, connector):
+        super().__init__(daemon=True)
+        self.connector = connector
+        self.snapshot = None
+        self._stop_requested = threading.Event()
+        self._wake = threading.Event()
+        self._reload = threading.Event()
+
+    def refresh(self, reload_champions=False):
+        if reload_champions:
+            self._reload.set()
+        self._wake.set()
+
+    def stop(self):
+        self._stop_requested.set()
+        self._wake.set()
+
+    def run(self):
+        state = ("Unknown", None, "", None)
+        while not self._stop_requested.is_set():
+            self._wake.clear()
+            if self._reload.is_set():
+                self._reload.clear()
+                self.connector.reload_champions()
+
+            def publish_phase(phase):
+                # Reuse a hero only from the current selection/loading sequence.
+                _, hero, source, _ = state
+                if state[0] in ("ChampSelect", "GameStart", "InProgress") and hero:
+                    self.snapshot = (phase, hero, source, None)
+
+            started = time.monotonic()
+            phase, hero, source, _ = self.connector.get_session_state(on_phase=publish_phase)
+            state = (phase, hero, source, None)
+            # Publish even if values repeat (F7 can request a fresh observation).
+            self.snapshot = state
+            interval = 0.25 if phase == "GameStart" else 0.5 if phase == "ChampSelect" else 2.0
+            self._wake.wait(max(0.05, interval - (time.monotonic() - started)))
