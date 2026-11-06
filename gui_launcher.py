@@ -74,32 +74,52 @@ class LogRedirector(io.TextIOBase):
                 pass
 
 
-# ================= 后台控制器 (替代 InputController) =================
+# ================= 后台控制器 (全自动引擎) =================
 
 class GUIController(threading.Thread):
-    """后台引擎: LCU 自动检测 + F6/F7 热键监听"""
+    """
+    后台全自动引擎:
+      1. 官方 API 全生命周期监听: 选人换人 / 局内开局 / 换局自动同步英雄 (免按 F7)
+      2. 局内海克斯弹窗自感知: 两阶段视觉门控 + 毫秒级防抖，弹窗自动推荐，选完自动隐去 (免按 F6)
+      3. 全局热键 F6/F7/F8 手动兜底
+    """
 
-    def __init__(self, overlay_queue, gui_queue, data_manager, analyzer, lcu_connector):
+    def __init__(self, overlay_queue, gui_queue, data_manager, analyzer, lcu_connector, auto_popup=True):
         super().__init__(daemon=True)
         self.overlay_queue = overlay_queue
         self.gui_queue = gui_queue
         self.dm = data_manager
         self.analyzer = analyzer
         self.lcu = lcu_connector
-        self.current_hero = None
-        self.running = True
-        self._last_f6 = 0
-        self._last_f7 = 0
-        self._last_f8 = 0
 
-    def run(self):
-        """主循环: 自动检测 → 监听"""
-        while self.running:
-            self._auto_detect_phase()
-            self._listening_phase()
+        self.current_hero = None
+        self.current_phase = "Unknown"
+        self.is_manual_hero = False
+        self.auto_popup_enabled = auto_popup
+        self.running = True
+
+        # 节流与状态记录
+        self._last_session_check = 0.0
+        self._last_popup_check = 0.0
+        self._prev_thumbnails = None
+        self._last_matched_thumbs = None
+        self._negative_thumbs = None
+        self._overlay_is_showing = False
+        self._last_results = {}
+        self._first_popup_pending = False
+
+        self._last_f6 = 0.0
+        self._last_f7 = 0.0
+        self._last_f8 = 0.0
 
     def stop(self):
         self.running = False
+
+    def set_auto_popup(self, enabled: bool):
+        self.auto_popup_enabled = bool(enabled)
+        if not self.auto_popup_enabled and self._overlay_is_showing:
+            self.overlay_queue.put({"cmd": "CLEAR"})
+            self._overlay_is_showing = False
 
     def _gui(self, **kwargs):
         """发送消息到 GUI"""
@@ -109,139 +129,218 @@ class GUIController(threading.Thread):
         """验证英雄名是否在数据库中，尝试模糊映射"""
         return self.dm.validate_hero(name)
 
-    def _try_auto_detect(self, verbose=False):
-        if not self.lcu:
-            if verbose:
-                print("⚠ LCU 连接器未初始化")
-            return None, ""
-        
-        # 先尝试连接
-        if not self.lcu.is_connected():
-            if verbose:
-                print("尝试连接 LCU...")
-            connected = self.lcu.connect()
-            if verbose:
-                if connected:
-                    print(f"✅ LCU 已连接 (端口: {self.lcu.port})")
-                else:
-                    print("⚠ LCU 未连接 (客户端可能未启动或需要管理员权限)")
-        
-        hero, source = self.lcu.get_champion_auto()
-        if verbose and not hero:
-            phase = self.lcu.get_gameflow_phase() if self.lcu.is_connected() else None
-            if phase:
-                print(f"   当前阶段: {phase} (未检测到英雄)")
-            else:
-                print("   未获取到游戏阶段信息")
-        
-        if hero:
-            validated = self._validate_hero(hero)
-            if validated:
-                return validated, source
-            elif verbose:
-                print(f"⚠ 英雄 [{hero}] 不在数据库中")
-        return None, source
-
     def set_hero(self, hero_name):
-        """手动设置英雄 (供 GUI 调用)"""
+        """手动设置英雄 (供 GUI 输入框调用)"""
         validated = self._validate_hero(hero_name)
         if validated:
             self.current_hero = validated
+            self.is_manual_hero = True
             print(f"✅ 已手动锁定英雄: {validated}")
             self._gui(event="hero_found", hero=validated, source="手动输入")
-            self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n按 F6 分析"})
+            self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n⚡ 自动识别已就绪", "duration": 2500})
             return validated
         return None
 
-    # ---------- 阶段1: 自动检测英雄 ----------
-
-    def _auto_detect_phase(self):
-        if not self.running:
-            return
+    def run(self):
+        """主事件循环: 热键监听 + 状态会话轮询 + 视觉弹窗检测"""
+        print("⚡ 全自动后台引擎已启动 (英雄自动同步 + 海克斯弹窗自动识别)")
         self._gui(event="status", status="connecting")
-        print("正在连接英雄联盟客户端...")
-
-        for attempt in range(15):  # 30秒轮询
-            if not self.running:
-                return
-
-            # 第一次和每5次详细输出
-            verbose = (attempt == 0 or attempt % 5 == 0)
-            hero, source = self._try_auto_detect(verbose=verbose)
-            if hero:
-                self.current_hero = hero
-                print(f"✅ 自动识别到英雄: [{hero}] (来源: {source})")
-                self._gui(event="hero_found", hero=hero, source=source)
-                self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {hero}\n按 F6 分析"})
-                return
-
-            # F8 中断自动检测
-            if keyboard.is_pressed('f8'):
-                break
-
-            self._gui(event="status", status="waiting", attempt=attempt)
-            time.sleep(2)
-
-        # 超时未检测到
-        print("暂未检测到英雄，可在上方手动输入英雄名")
-        print("提示: 如果客户端已打开，请尝试以管理员身份运行本程序")
-        self._gui(event="status", status="idle")
-        self.overlay_queue.put({"cmd": "STATUS", "data": "暂无英雄\n按 F7 或手动输入"})
-
-    # ---------- 阶段2: 热键监听 ----------
-
-    def _listening_phase(self):
-        if not self.running:
-            return
-        self._gui(event="status", status="listening", hero=self.current_hero)
-        print(f"热键监听中... 当前英雄: {self.current_hero or '未指定'}")
 
         while self.running:
             now = time.time()
 
-            # F6 - 分析海克斯
-            if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
-                self._last_f6 = now
-                if not self.current_hero:
-                    self.overlay_queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 获取"})
-                    self._gui(event="status", status="no_hero_warning")
+            # 1. 手动全局热键响应 (兜底)
+            self._handle_hotkeys(now)
+
+            # 2. 定期同步游戏会话状态与当前英雄 (自适应频率)
+            interval = 1.2 if self.current_phase in ("ChampSelect", "GameStart") else 2.5
+            if now - self._last_session_check > interval:
+                self._last_session_check = now
+                self._sync_session_and_hero()
+
+            # 3. 局内自动检测海克斯弹窗 (高速采样 0.12s + 即时反馈 + Fast-Track)
+            if self.auto_popup_enabled and self.current_hero and self.current_phase == "InProgress":
+                if now - self._last_popup_check > 0.12:
+                    self._last_popup_check = now
+                    self._check_in_game_popup()
+
+            time.sleep(0.03)
+
+    def _handle_hotkeys(self, now):
+        """热键监听逻辑 (F6=强制分析, F7=强制刷新, F8=重置)"""
+        # F6: 强制分析
+        if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
+            self._last_f6 = now
+            if not self.current_hero:
+                self.overlay_queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 获取或手动输入", "duration": 2500})
+                self._gui(event="status", status="no_hero_warning")
+            else:
+                self._gui(event="status", status="analyzing", hero=self.current_hero)
+                self.overlay_queue.put({"cmd": "STATUS", "data": f"🔎 分析 [{self.current_hero}]...", "duration": 1500})
+                results = self.analyzer.analyze(self.current_hero)
+                self._last_results = results
+                self.overlay_queue.put({"cmd": "UPDATE", "data": results, "duration": 8000})
+                self._overlay_is_showing = True
+                self._gui(event="status", status="analyzed", hero=self.current_hero)
+
+        # F7: 强制刷新英雄与客户端连接
+        if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
+            self._last_f7 = now
+            self._gui(event="status", status="refreshing")
+            self.overlay_queue.put({"cmd": "STATUS", "data": "刷新英雄中...", "duration": 1500})
+            self.is_manual_hero = False
+            self._sync_session_and_hero(force_verbose=True)
+
+        # F8: 重置当前英雄与检测状态
+        if keyboard.is_pressed('f8') and now - self._last_f8 > 1.0:
+            self._last_f8 = now
+            print("F8: 重置状态并重新自动侦测")
+            self._gui(event="status", status="resetting")
+            self.current_hero = None
+            self.is_manual_hero = False
+            self._overlay_is_showing = False
+            self._last_matched_thumbs = None
+            self._negative_thumbs = None
+            self._last_results = {}
+            self.overlay_queue.put({"cmd": "CLEAR"})
+            time.sleep(0.3)
+
+    def _sync_session_and_hero(self, force_verbose=False):
+        """同步游戏阶段与当前英雄"""
+        if not self.lcu:
+            return
+
+        phase, raw_hero, source, details = self.lcu.get_session_state()
+        old_phase = self.current_phase
+        self.current_phase = phase
+
+        if phase == "InProgress" and old_phase != "InProgress":
+            self._first_popup_pending = True
+        if old_phase == "InProgress" and phase != "InProgress":
+            if self._overlay_is_showing:
+                self.overlay_queue.put({"cmd": "CLEAR"})
+            self._overlay_is_showing = False
+            self._prev_thumbnails = None
+            self._last_matched_thumbs = None
+            self._negative_thumbs = None
+            self._last_results = {}
+            self._first_popup_pending = False
+            self._gui(event="status", status="listening")
+
+        # 如果对局重置回到选人或大厅，解除手动锁定
+        if phase in ("ChampSelect", "Lobby", "Matchmaking") and old_phase in ("InProgress", "GameStart"):
+            self.is_manual_hero = False
+
+        if raw_hero:
+            validated = self._validate_hero(raw_hero)
+            if validated:
+                if validated != self.current_hero and not self.is_manual_hero:
+                    old_hero = self.current_hero
+                    self.current_hero = validated
+                    print(f"✅ 自动锁定英雄 ({source}): {old_hero or '无'} → {validated}")
+                    self._gui(event="hero_found", hero=validated, source=source)
+                    self.overlay_queue.put({
+                        "cmd": "STATUS", 
+                        "data": f"当前: {validated}\n⚡ 自动识别已就绪", 
+                        "duration": 2500
+                    })
+                elif not self.current_hero:
+                    self.current_hero = validated
+                    self._gui(event="hero_found", hero=validated, source=source)
+                    self.overlay_queue.put({
+                        "cmd": "STATUS", 
+                        "data": f"当前: {validated}\n⚡ 自动识别已就绪", 
+                        "duration": 2500
+                    })
+        elif force_verbose:
+            self.overlay_queue.put({"cmd": "STATUS", "data": f"当前未检测到英雄\n阶段: {phase}", "duration": 2000})
+
+    def _check_in_game_popup(self):
+        """局内海克斯弹窗自感知逻辑 (极速门控 + 即时状态反馈 + 局部增量重算)"""
+        # 截取文字区域
+        images = self.analyzer.capture_all_regions()
+        if not images:
+            return
+
+        curr_thumbs = self.analyzer.compute_thumbnails(images)
+
+        # 1. 遮罩正在显示时的消隐/单卡刷新检测
+        if self._overlay_is_showing:
+            if self._last_matched_thumbs:
+                is_same, diff_keys = self.analyzer.is_same_thumbs(curr_thumbs, self._last_matched_thumbs, threshold=6.5)
+                if not is_same:
+                    # 检查画面是否彻底离开了海克斯弹窗 (选完了卡牌进入战斗)
+                    gate_pass, _ = self.analyzer.check_visual_gate(curr_thumbs)
+                    if not gate_pass or len(diff_keys) == 3:
+                        # 丢弃旧结果，下一帧重新确认弹窗
+                        self.overlay_queue.put({"cmd": "CLEAR"})
+                        self._overlay_is_showing = False
+                        self._last_matched_thumbs = None
+                        self._negative_thumbs = None
+                        self._prev_thumbnails = curr_thumbs
+                        return
+                    else:
+                        refreshed = self.analyzer.analyze_stable_refresh(
+                            self.current_hero, curr_thumbs, self._last_results, diff_keys
+                        )
+                        if refreshed is not None and self.auto_popup_enabled:
+                            results, confirmed_thumbs, changed_keys = refreshed
+                            self._last_matched_thumbs.update(confirmed_thumbs)
+                            if changed_keys:
+                                self.overlay_queue.put({"cmd": "RECOGNIZING", "keys": changed_keys})
+                                time.sleep(0.3)
+                                if self.auto_popup_enabled:
+                                    self._last_results = results
+                                    self.overlay_queue.put({"cmd": "UPDATE", "data": results, "duration": 20000})
+                        self._prev_thumbnails = curr_thumbs
+                        return
                 else:
-                    self._gui(event="status", status="analyzing", hero=self.current_hero)
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"🔎 分析 [{self.current_hero}]..."})
-                    print(f"正在分析: {self.current_hero}...")
-                    results = self.analyzer.analyze(self.current_hero)
-                    self.overlay_queue.put({"cmd": "UPDATE", "data": results})
-                    self._gui(event="status", status="analyzed", hero=self.current_hero)
-                    print(f"分析完成: {self.current_hero}")
+                    # 缩略图完全一致，继续保持显示，跳过 OCR
+                    self._prev_thumbnails = curr_thumbs
+                    return
 
-            # F7 - 刷新英雄
-            if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
-                self._last_f7 = now
-                self._gui(event="status", status="refreshing")
-                self.overlay_queue.put({"cmd": "STATUS", "data": "刷新英雄..."})
-                hero, source = self._try_auto_detect()
-                if hero and hero != self.current_hero:
-                    old = self.current_hero
-                    self.current_hero = hero
-                    print(f"英雄已切换 ({source}): {old} → {hero}")
-                    self._gui(event="hero_found", hero=hero, source=source)
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"已切换: {hero}\n按 F6 分析"})
-                elif hero:
-                    self._gui(event="hero_confirmed", hero=hero)
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {hero}\n按 F6 分析"})
-                else:
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {self.current_hero or '未知'}\n按 F6 分析"})
+        # 2. 阶段1: 视觉门控 (<2ms)
+        gate_passed, reason = self.analyzer.check_visual_gate(curr_thumbs, self._prev_thumbnails)
+        self._prev_thumbnails = curr_thumbs
 
-            # F8 - 重新进入自动检测
-            if keyboard.is_pressed('f8') and now - self._last_f8 > 1.0:
-                self._last_f8 = now
-                print("F8: 重新进入自动检测阶段")
-                self._gui(event="status", status="resetting")
-                self.current_hero = None
-                time.sleep(0.5)
-                return  # 退出 listening_phase, 回到 auto_detect
+        if not gate_passed:
+            return
 
-            time.sleep(0.05)
+        # 检查是否命中负样本 (上一轮判定非海克斯且画面未变，避免重复耗能)
+        if self._negative_thumbs:
+            is_neg_same, _ = self.analyzer.is_same_thumbs(curr_thumbs, self._negative_thumbs, threshold=4.5)
+            if is_neg_same:
+                return
+
+        # 视觉门控也会放行普通游戏画面，后台确认后才显示推荐
+        time.sleep(0.06)
+        confirm_images = self.analyzer.capture_all_regions()
+        results = self.analyzer.analyze(self.current_hero, images=confirm_images)
+        if not self.auto_popup_enabled:
+            return
+
+        # 判定是否属于有效的海克斯三选一弹窗:
+        # 条件: 3 个卡牌区域中有效匹配到的海克斯数量 >= 2，且平均相似度 >= 65
+        valid_items = [v for v in results.values() if v.get("valid")]
+        if len(valid_items) >= 2:
+            scores = [v.get("score", 0) for v in valid_items]
+            avg_score = sum(scores) / len(scores) if scores else 0
+            if avg_score >= 65:
+                print(f"✨ 自动识别到海克斯选择弹窗! ({len(valid_items)}/3 卡牌已匹配, 平均匹配度: {avg_score:.1f})")
+                self.overlay_queue.put({
+                    "cmd": "UPDATE", "data": results, "duration": 20000,
+                    "opening": self._first_popup_pending,
+                })
+                self._first_popup_pending = False
+                self._overlay_is_showing = True
+                self._last_results = results
+                self._last_matched_thumbs = self.analyzer.compute_thumbnails(confirm_images)
+                self._negative_thumbs = None
+                self._gui(event="status", status="auto_detected", hero=self.current_hero)
+                return
+
+        # 记录未通过 OCR 确认的画面，避免对相同画面重复识别
+        self._negative_thumbs = curr_thumbs
 
 
 # ================= 系统托盘管理 =================
@@ -734,7 +833,7 @@ class LauncherApp:
 
         # ---- 热键提示 ----
         hotkey_frame = tk.Frame(main, bg=self.BG)
-        hotkey_frame.pack(fill=tk.X, pady=(0, 12))
+        hotkey_frame.pack(fill=tk.X, pady=(0, 8))
         hotkeys = [("F6", "分析海克斯"), ("F7", "识别英雄"), ("F8", "重置")]
         for key, desc in hotkeys:
             pill = tk.Frame(hotkey_frame, bg=self.BORDER, padx=1, pady=1)
@@ -745,6 +844,26 @@ class LauncherApp:
                      fg=self.ACCENT, bg=self.BG_CARD).pack(side=tk.LEFT, padx=(0, 4))
             tk.Label(inner, text=desc, font=("Microsoft YaHei", 9),
                      fg=self.TEXT_DIM, bg=self.BG_CARD).pack(side=tk.LEFT)
+
+        # ---- 自动识别海克斯开关 ----
+        auto_toggle_frame = tk.Frame(main, bg=self.BG)
+        auto_toggle_frame.pack(fill=tk.X, pady=(0, 10))
+        self.auto_popup_var = tk.BooleanVar(value=True)
+        self.auto_check = tk.Checkbutton(
+            auto_toggle_frame,
+            text="⚡ 局内自动感知海克斯 (弹窗自动推荐/选完自隐，免按 F6)",
+            variable=self.auto_popup_var,
+            command=self._on_toggle_auto_popup,
+            font=("Microsoft YaHei", 9),
+            fg=self.SUCCESS,
+            selectcolor=self.BG_CARD,
+            activebackground=self.BG,
+            activeforeground=self.ACCENT,
+            bg=self.BG,
+            relief=tk.FLAT,
+            bd=0
+        )
+        self.auto_check.pack(anchor="w")
 
         # ---- 按钮区域 ----
         btn_frame = tk.Frame(main, bg=self.BG)
@@ -855,6 +974,14 @@ class LauncherApp:
 
         threading.Thread(target=_init, daemon=True).start()
 
+    def _on_toggle_auto_popup(self):
+        """用户切换自动感知开关"""
+        enabled = self.auto_popup_var.get()
+        if self.controller:
+            self.controller.set_auto_popup(enabled)
+        state_str = "已开启 (弹窗自动推荐/选完自隐)" if enabled else "已关闭 (改用手动 F6)"
+        self._log(f"⚡ 局内海克斯自动识别: {state_str}")
+
     def _create_overlay_and_start(self):
         """在主线程中创建 overlay 窗口并启动控制器"""
         try:
@@ -864,16 +991,17 @@ class LauncherApp:
             self.overlay_window = tk.Toplevel(self.root)
             self.overlay = OverlayApp(self.overlay_window, self.overlay_queue)
 
-            # 启动后台控制器
+            # 启动后台控制器 (同步自动识别开关)
             self.controller = GUIController(
                 self.overlay_queue, self.gui_queue,
-                self.dm, self.analyzer, self.lcu
+                self.dm, self.analyzer, self.lcu,
+                auto_popup=self.auto_popup_var.get()
             )
             self.controller.start()
 
             self.engine_running = True
             self._set_status("运行中", self.SUCCESS)
-            self._log("✅ 引擎已启动! F6=分析 | F7=识别 | F8=重置")
+            self._log("✅ 引擎已启动! 局内弹窗自动识别中 (亦可按 F6 分析 / F7 刷新 / F8 重置)")
             self._start_pulse()
 
             # 启动托盘
@@ -1048,6 +1176,7 @@ class LauncherApp:
                 "listening":        ("监听中", self.SUCCESS),
                 "analyzing":        ("分析中...", self.ACCENT),
                 "analyzed":         ("分析完成", self.SUCCESS),
+                "auto_detected":    ("已自动识别推荐", self.SUCCESS),
                 "refreshing":       ("刷新英雄...", self.WARNING),
                 "no_hero_warning":  ("未锁定英雄", self.ERROR),
                 "idle":             ("运行中 (无英雄)", self.TEXT_DIM),
