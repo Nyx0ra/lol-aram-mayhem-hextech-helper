@@ -70,23 +70,23 @@ flowchart TD
 ## 3. 关键业务机制与算法规范
 
 ### 3.1 全自动英雄感知流程 (LCU + Live API)
-系统以 **1.2s ~ 2.5s** 自适应频率轮询本地接口，覆盖三大阶段：
-1. **选人阶段 (ChampSelect)**: 请求 `/lol-champ-select/v1/session`，跟踪 `myTeam` 中本玩家的 `championId`。在选人阶段摇骰子或更换英雄时，1 秒内完成响应。
-2. **对局进行阶段 (InProgress)**: 请求 `/lol-gameflow/v1/session` 获取 `gameData` 中的当前英雄。
-3. **局内备用通道 (Live Client Data)**: 请求 `https://127.0.0.1:2999/liveclientdata/activeplayername` 与 `allplayers`。
+GUI 和 CLI 在选人、载入阶段按 1.2 秒间隔轮询。其他阶段 GUI 用 2.5 秒，CLI 用 2 秒。接口请求本身也占用时间。
+1. **选人阶段 (ChampSelect)** 从 `/lol-champ-select/v1/session` 的 `myTeam` 中获取本玩家的 `championId`。
+2. **载入或对局阶段 (GameStart / InProgress)** 从 `/lol-gameflow/v1/session` 的 `gameData` 获取英雄。
+3. **局内备用通道 (Live Client Data)** 统一会话接口调用 `https://127.0.0.1:2999/liveclientdata/allgamedata`。LCU 未连接而 Live API 确认在局内时，会话阶段为 `InProgress`。
 4. **容错解析器规范 (`_resolve_champion_name`)**：
    * 客户端接口返回的可能为内部 key（如 `game_character_displayname_Ezreal`）、英文别名（`MonkeyKing`、`DrMundo`）、纯小写或带空格。
    * 必须由 `LCUConnector._resolve_champion_name()` 统一剥离前缀并对照 `champions.json` 转换为标准中文名（如“探险家”、“齐天大圣”）。
 
 ### 3.2 局内海克斯两阶段视觉门控流水线 (Fast-Track)
-为兼顾**毫秒级响应**与**极低 CPU 占用**，严禁对游戏画面直接无脑进行 OCR。必须严格执行以下两阶段：
+GUI 和 CLI 仅在 `InProgress` 且已有英雄时自动扫描。F6 可手动触发 OCR。自动识别通过以下两阶段筛选画面。
 
 ```mermaid
 flowchart TD
-    Start["截取三张卡牌标题区<br/>capture_all_regions (<2ms)"] --> Thumb["OpenCV 降采样为 32x10 特征矩阵<br/>compute_thumbnails"]
+    Start["截取三张卡牌标题区<br/>capture_all_regions"] --> Thumb["OpenCV 降采样为 32x10 特征矩阵<br/>compute_thumbnails"]
     Thumb --> Gate{"视觉门控 check_visual_gate<br/>1. 帧间差 <= 8.0 (排除走位/团战)<br/>2. 亮度 15~245 & 水平梯度 >= 2.5"}
 
-    Gate -- 未通过 --> Sleep["休眠 120ms，继续监听"]
+    Gate -- 未通过 --> Sleep["等待下一次采样"]
     Gate -- 通过 --> Neg{"指纹是否命中负样本<br/>is_same_thumbs <= 4.5"}
 
     Neg -- 是负样本 --> Sleep
@@ -94,7 +94,7 @@ flowchart TD
     Settle --> ConfirmOCR["二次采样并执行 OCR 推理<br/>GameAnalyzer.analyze"]
     ConfirmOCR --> Val{"匹配结果评分<br/>有效卡 >= 2张 & 平均分 >= 65"}
 
-    Val -- 成功 --> ShowOverlay["常驻悬浮窗<br/>显示推荐与梯队颜色"]
+    Val -- 成功 --> ShowOverlay["显示推荐与梯队颜色"]
     Val -- 失败 --> RecordNeg["记录为负样本，不显示提示"]
 ```
 
@@ -102,9 +102,9 @@ flowchart TD
 
 ### 3.3 单卡 Reroll 局部增量刷新流水线
 当悬浮窗正在显示期间：
-1. 持续每 120ms 比对当前特征矩阵与上一帧基准。
+1. 采样间隔为 120ms，当前指纹与最近一次确认的卡牌指纹比对。
 2. 若画面变为低对比度背景，或三张卡的区域同时变化，清空旧遮罩并重新走弹窗确认流程。
-3. 若画面仍然通过门控，但仅个别卡牌特征变化（玩家对单卡点击了掷骰子 Reroll）：
+3. 画面仍通过门控且仅部分卡牌的指纹变化时，再核对卡名：
    * 等待 240ms 后重新截取变动卡牌。两次采样一致后用 OCR 核对卡名。
    * 卡名一致时只更新比对指纹。确认新卡后在变动位置短暂显示刷新提示，再一次性更新排序。
 
