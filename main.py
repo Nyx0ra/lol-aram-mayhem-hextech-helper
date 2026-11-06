@@ -427,7 +427,7 @@ class GameAnalyzer:
         单卡刷新重算速度提升 300%！
         """
         if not hero_cn: return {}
-        results = dict(existing_results) if existing_results else {}
+        results = {key: item.copy() for key, item in existing_results.items()} if existing_results else {}
         for key in target_keys:
             img = images.get(key)
             if img is not None:
@@ -452,6 +452,31 @@ class GameAnalyzer:
                     results[item['key']]["highlight"] = True
 
         return results
+
+    def analyze_stable_refresh(self, hero_cn, thumbs, existing_results, target_keys):
+        """等重掷动画稳定后，只识别变动卡牌。返回 OCR 实际采样的指纹。"""
+        time.sleep(0.24)
+        images = self.capture_all_regions(target_keys=target_keys)
+        if any(key not in images for key in target_keys):
+            return None
+
+        confirmed_thumbs = self.compute_thumbnails(images)
+        stable, _ = self.is_same_thumbs(
+            confirmed_thumbs, {key: thumbs[key] for key in target_keys}, threshold=3.0
+        )
+        if not stable:
+            return None
+
+        results = self.analyze_partial(hero_cn, images, existing_results, target_keys)
+        changed_keys = []
+        for key in target_keys:
+            result = results.get(key, {})
+            old_name = existing_results.get(key, {}).get("match_name")
+            if not result.get("valid") or result.get("score", 0) < 65:
+                return None
+            if result.get("match_name") != old_name:
+                changed_keys.append(key)
+        return results, confirmed_thumbs, changed_keys
 
 # ================= 3. UI 界面 (View) =================
 
@@ -509,7 +534,11 @@ class OverlayApp:
                 
                 if cmd == "UPDATE":
                     duration = msg.get("duration", 5000)
-                    self.update_display(data, duration=duration)
+                    if msg.get("opening"):
+                        self.show_status("⚡ 正在分析推荐...", duration=0)
+                        self.hide_timer = self.root.after(650, self._finish_opening, data, duration)
+                    else:
+                        self.update_display(data, duration=duration)
                 elif cmd == "RECOGNIZING":
                     keys = msg.get("keys")
                     self.show_recognizing(keys)
@@ -530,20 +559,19 @@ class OverlayApp:
         for lbl in self.labels.values():
             lbl.place_forget()
 
-    def show_recognizing(self, target_keys=None):
-        """
-        即时反馈: 当检测到海克斯弹窗刚出现或单卡被刷新时，立即在对应卡牌上方浮现提示，
-        让用户在 0.05 秒内感知到系统正在工作，消除等待盲区。
-        """
+    def _finish_opening(self, results, duration):
+        self.hide_timer = None
+        self.update_display(results, duration=duration)
+
+    def show_recognizing(self, target_keys):
+        """在已确认弹窗的变动卡牌上方显示重掷识别提示。"""
         base_y_abs = REGIONS['hex_1']['top']
         fixed_rel_y = base_y_abs - self.offset_y - 120
 
-        keys_to_show = target_keys if target_keys else list(REGIONS.keys())
-        for key in keys_to_show:
+        for key in target_keys or ():
             if key in self.labels:
                 lbl = self.labels[key]
-                prompt = "🎲 刷新识别中..." if target_keys and len(target_keys) < 3 else "⚡ 正在分析推荐..."
-                lbl.config(text=prompt, fg=COLORS["status"])
+                lbl.config(text="🎲 刷新识别中...", fg=COLORS["status"])
                 r_left = REGIONS[key]['left'] - self.offset_x
                 lbl.place(x=r_left, y=fixed_rel_y, anchor="nw")
                 lbl.lift()
@@ -738,6 +766,7 @@ class InputController(threading.Thread):
         print(f"[监听中...] 当前英雄: {self.current_hero} | F6分析 / F7刷新 / F8手动")
         print("⚡ 局内海克斯弹窗全自动感知已激活 (弹窗自动推荐，选完自动隐藏)")
 
+        phase = "Unknown"
         last_sync = 0.0
         last_popup = 0.0
         prev_thumbs = None
@@ -745,6 +774,7 @@ class InputController(threading.Thread):
         negative_thumbs = None
         overlay_showing = False
         last_results = {}
+        first_popup_pending = False
 
         while True:
             now = time.time()
@@ -781,10 +811,23 @@ class InputController(threading.Thread):
                 time.sleep(0.5)
                 return  # 退出监听，回到 select_hero_phase
 
-            # 2. 定期自动同步英雄 (每 2 秒)
-            if self.lcu and now - last_sync > 2.0:
+            # 2. 定期自动同步英雄，选人和载入阶段加快轮询
+            interval = 1.2 if phase in ("ChampSelect", "GameStart") else 2.0
+            if self.lcu and now - last_sync > interval:
                 last_sync = now
+                old_phase = phase
                 phase, hero, source, _ = self.lcu.get_session_state()
+                if phase == "InProgress" and old_phase != "InProgress":
+                    first_popup_pending = True
+                if old_phase == "InProgress" and phase != "InProgress":
+                    if overlay_showing:
+                        self.queue.put({"cmd": "CLEAR"})
+                    overlay_showing = False
+                    prev_thumbs = None
+                    last_matched_thumbs = None
+                    negative_thumbs = None
+                    last_results = {}
+                    first_popup_pending = False
                 if hero:
                     validated = self._validate_hero(hero)
                     if validated and validated != self.current_hero:
@@ -794,7 +837,7 @@ class InputController(threading.Thread):
                         self.queue.put({"cmd": "STATUS", "data": f"已切换: {validated}\n⚡ 自动识别就绪", "duration": 2500})
 
             # 3. 局内自动检测海克斯弹窗 (高速采样 0.12s + 即时反馈 + Fast-Track)
-            if self.current_hero and now - last_popup > 0.12:
+            if self.current_hero and phase == "InProgress" and now - last_popup > 0.12:
                 last_popup = now
                 images = self.analyzer.capture_all_regions()
                 if images:
@@ -805,7 +848,7 @@ class InputController(threading.Thread):
                             is_same, diff_keys = self.analyzer.is_same_thumbs(curr_thumbs, last_matched_thumbs, threshold=6.5)
                             if not is_same:
                                 gate_pass, _ = self.analyzer.check_visual_gate(curr_thumbs)
-                                if not gate_pass:
+                                if not gate_pass or len(diff_keys) == 3:
                                     self.queue.put({"cmd": "CLEAR"})
                                     overlay_showing = False
                                     last_matched_thumbs = None
@@ -813,17 +856,17 @@ class InputController(threading.Thread):
                                     prev_thumbs = curr_thumbs
                                     continue
                                 else:
-                                    # 画面仍有文字，某张卡发生变动 (单卡刷新 Reroll):
-                                    # 1. 立即给对应卡牌显示 "🎲 刷新识别中..."
-                                    self.queue.put({"cmd": "RECOGNIZING", "keys": diff_keys})
-                                    # 2. 仅对变动的卡执行增量 OCR (耗时缩减 300%)
-                                    diff_images = self.analyzer.capture_all_regions(target_keys=diff_keys)
-                                    results = self.analyzer.analyze_partial(
-                                        self.current_hero, diff_images, last_results, diff_keys
+                                    refreshed = self.analyzer.analyze_stable_refresh(
+                                        self.current_hero, curr_thumbs, last_results, diff_keys
                                     )
-                                    last_results = results
-                                    last_matched_thumbs = curr_thumbs
-                                    self.queue.put({"cmd": "UPDATE", "data": results, "duration": 20000})
+                                    if refreshed is not None:
+                                        results, confirmed_thumbs, changed_keys = refreshed
+                                        last_matched_thumbs.update(confirmed_thumbs)
+                                        if changed_keys:
+                                            self.queue.put({"cmd": "RECOGNIZING", "keys": changed_keys})
+                                            time.sleep(0.3)
+                                            last_results = results
+                                            self.queue.put({"cmd": "UPDATE", "data": results, "duration": 20000})
                                     prev_thumbs = curr_thumbs
                                     continue
                             else:
@@ -838,10 +881,7 @@ class InputController(threading.Thread):
                         if negative_thumbs:
                             is_neg, _ = self.analyzer.is_same_thumbs(curr_thumbs, negative_thumbs, threshold=4.5)
                         if not is_neg:
-                            # 刚捕获到疑似弹窗 -> 立即浮现识别中提示 (0.05 秒内即时反馈，消除等待焦虑)
-                            self.queue.put({"cmd": "RECOGNIZING"})
-                            
-                            # Fast-Track 极速防抖确认 (等待 60ms 画面渲染稳定)
+                            # 等待画面稳定，在后台用 OCR 确认弹窗
                             time.sleep(0.06)
                             confirm_images = self.analyzer.capture_all_regions()
                             results = self.analyzer.analyze(self.current_hero, images=confirm_images)
@@ -851,14 +891,17 @@ class InputController(threading.Thread):
                                 avg_score = sum(scores) / len(scores) if scores else 0
                                 if avg_score >= 65:
                                     print(f"✨ 自动识别到海克斯选择界面! ({len(valid_items)}/3 卡牌已匹配)")
-                                    self.queue.put({"cmd": "UPDATE", "data": results, "duration": 20000})
+                                    self.queue.put({
+                                        "cmd": "UPDATE", "data": results, "duration": 20000,
+                                        "opening": first_popup_pending,
+                                    })
+                                    first_popup_pending = False
                                     overlay_showing = True
                                     last_results = results
-                                    last_matched_thumbs = curr_thumbs
+                                    last_matched_thumbs = self.analyzer.compute_thumbnails(confirm_images)
                                     negative_thumbs = None
                                     continue
-                            # 未达置信度，清空提示并记录负样本
-                            self.queue.put({"cmd": "CLEAR"})
+                            # 未达置信度，记录负样本
                             negative_thumbs = curr_thumbs
 
             time.sleep(0.04)

@@ -2,14 +2,17 @@
 自动化单元测试: 验证 LCU 接口解析、视觉门控与防抖比对
 """
 import os
+import queue
 import sys
+from unittest.mock import Mock, patch
 import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
 from scripts.lcu_connector import LCUConnector
-from main import DataManager, GameAnalyzer
+from gui_launcher import GUIController
+from main import DataManager, GameAnalyzer, InputController
 
 def test_champion_resolver():
     print(">>> 测试 1: LCUConnector 英雄名称解析兼容性")
@@ -110,7 +113,157 @@ def test_visual_gate_and_fingerprints():
     print("  -> 视觉门控与防抖测试全部通过!\n")
 
 
+def test_popup_session_gate():
+    print(">>> 测试 3: 选人、加载和局内的自动弹窗控制")
+    sessions = [
+        ("ChampSelect", "探险家"),
+        ("ChampSelect", "暗裔剑魔"),
+        ("ChampSelect", "暗裔剑魔"),
+        ("Unknown", None),  # 模拟轮询跳过 GameStart
+        ("InProgress", "暗裔剑魔"),
+        ("InProgress", "暗裔剑魔"),
+        ("InProgress", "暗裔剑魔"),
+        ("InProgress", "暗裔剑魔"),
+        ("InProgress", "暗裔剑魔"),
+        ("InProgress", "暗裔剑魔"),
+        ("InProgress", "暗裔剑魔"),
+        ("InProgress", "暗裔剑魔"),
+        ("WaitingForStats", None),
+        ("Disconnected", None),
+    ]
+    for controller_class, entry_point in [
+        (GUIController, "run"),
+        (InputController, "listening_phase"),
+    ]:
+        overlay = queue.Queue()
+        gui = queue.Queue()
+        dm = Mock(validate_hero=lambda hero: hero)
+        analyzer = Mock()
+        lcu = Mock()
+        phase = None
+        captures = []
+        commands = {}
+        opening_attempts = []
+
+        def get_session_state():
+            nonlocal phase
+            phase, hero = next(session_iter)
+            return phase, hero, "LCU", None
+
+        def capture_all_regions(target_keys=None):
+            captures.append(phase)
+            return {"hex_1": np.ones((10, 32))}
+
+        def put_overlay(message):
+            command = message["cmd"]
+            if command == "UPDATE" and message.get("opening"):
+                command = "OPENING"
+                opening_attempts.append(analyzer.analyze.call_count)
+            commands.setdefault(phase, []).append(command)
+
+        session_iter = iter(sessions)
+        lcu.get_session_state.side_effect = get_session_state
+        analyzer.capture_all_regions.side_effect = capture_all_regions
+        analyzer.compute_thumbnails.side_effect = lambda images: images
+        analyzer.check_visual_gate.return_value = (True, "passed")
+        analyzer.is_same_thumbs.side_effect = [
+            (False, ["hex_1"]),  # 普通画面的指纹变化，绕过上一帧负样本缓存
+            (False, ["hex_2"]),
+            (False, ["hex_2"]),  # 单卡重掷
+            (False, ["hex_2"]),  # 动画结束后的稳定卡面
+            (False, ["hex_1", "hex_2", "hex_3"]),  # 选完后整幅画面变化
+            (False, ["hex_1"]),  # 下一次真正的弹窗与负样本不同
+        ]
+        valid_results = {
+            key: {"valid": True, "score": 100} for key in ("hex_1", "hex_2")
+        }
+        analyzer.analyze.side_effect = [{}, {}, valid_results, {}, valid_results]
+        refreshed_thumbs = {"hex_2": np.ones((10, 32))}
+        analyzer.analyze_stable_refresh.side_effect = [
+            (valid_results, refreshed_thumbs, []),
+            (valid_results, refreshed_thumbs, ["hex_2"]),
+        ]
+
+        if controller_class is GUIController:
+            controller = controller_class(overlay, gui, dm, analyzer, lcu)
+        else:
+            controller = controller_class(overlay, dm, analyzer, lcu)
+            controller.flush_input = Mock()
+
+        module = sys.modules[controller_class.__module__]
+        with patch.object(overlay, "put", side_effect=put_overlay), \
+                patch.object(module, "time") as clock, \
+                patch.object(module.keyboard, "is_pressed", return_value=False):
+            clock.time.side_effect = [3.0 * i for i in range(1, len(sessions) + 1)]
+            clock.monotonic.return_value = 1.0
+            try:
+                getattr(controller, entry_point)()
+            except StopIteration:
+                pass
+
+        assert set(captures) == {"InProgress"}, f"{controller_class.__name__} 截图阶段: {captures}"
+        assert commands["InProgress"] == [
+            "OPENING", "RECOGNIZING", "UPDATE", "CLEAR", "UPDATE"
+        ], commands["InProgress"]
+        assert opening_attempts == [3], "前两次 OCR 拒绝时应保持静默"
+        assert analyzer.analyze.call_count == 5
+        assert analyzer.analyze_stable_refresh.call_count == 2
+        assert analyzer.analyze_stable_refresh.call_args.args[-1] == ["hex_2"]
+        assert commands["WaitingForStats"] == ["CLEAR"]
+        assert controller.current_hero == "暗裔剑魔"
+        print(f"  [PASS] {controller_class.__name__} 仅在局内自动识别，离开对局清除悬浮窗")
+
+
+def test_rejected_popup_is_silent():
+    overlay = queue.Queue()
+    gui = queue.Queue()
+    analyzer = Mock()
+    analyzer.capture_all_regions.return_value = {"hex_1": np.ones((10, 32))}
+    analyzer.compute_thumbnails.side_effect = lambda images: images
+    analyzer.check_visual_gate.return_value = (True, "passed")
+    analyzer.analyze.return_value = {}
+    controller = GUIController(overlay, gui, None, analyzer, None)
+    controller.current_hero = "探险家"
+    controller.current_phase = "InProgress"
+
+    with patch("gui_launcher.time.sleep"):
+        controller._check_in_game_popup()
+
+    assert overlay.empty(), list(overlay.queue)
+    assert gui.empty(), list(gui.queue)
+    print("  [PASS] OCR 拒绝疑似弹窗时不显示分析提示")
+
+
+def test_refresh_waits_for_new_card():
+    analyzer = GameAnalyzer.__new__(GameAnalyzer)
+    key = "hex_2"
+    candidate = {key: np.full((10, 32), 40, dtype=np.uint8)}
+    animated = {key: np.full((10, 32), 80, dtype=np.uint8)}
+    stable = {key: np.full((10, 32), 42, dtype=np.uint8)}
+    old = {key: {"valid": True, "score": 100, "match_name": "旧卡"}}
+    new = {key: {"valid": True, "score": 100, "match_name": "新卡"}}
+    analyzer.capture_all_regions = Mock(side_effect=[animated, stable, stable])
+    analyzer.analyze_partial = Mock(side_effect=[old, new])
+
+    with patch("main.time.sleep"):
+        assert analyzer.analyze_stable_refresh("探险家", candidate, old, [key]) is None
+        analyzer.analyze_partial.assert_not_called()
+        _, hover_thumbs, changed_keys = analyzer.analyze_stable_refresh("探险家", candidate, old, [key])
+        assert changed_keys == []
+        assert np.array_equal(hover_thumbs[key], stable[key])
+        results, thumbs, changed_keys = analyzer.analyze_stable_refresh("探险家", candidate, old, [key])
+
+    assert results == new
+    assert changed_keys == [key]
+    assert np.array_equal(thumbs[key], stable[key])
+    assert analyzer.capture_all_regions.call_args.kwargs == {"target_keys": [key]}
+    print("  [PASS] 重掷忽略动画帧和旧卡，使用已识别的新卡画面作为基准")
+
+
 if __name__ == '__main__':
     test_champion_resolver()
     test_visual_gate_and_fingerprints()
+    test_popup_session_gate()
+    test_rejected_popup_is_silent()
+    test_refresh_waits_for_new_card()
     print("🎉 全部自动化测试通过!")

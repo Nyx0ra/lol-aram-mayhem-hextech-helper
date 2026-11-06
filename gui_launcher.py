@@ -106,6 +106,7 @@ class GUIController(threading.Thread):
         self._negative_thumbs = None
         self._overlay_is_showing = False
         self._last_results = {}
+        self._first_popup_pending = False
 
         self._last_f6 = 0.0
         self._last_f7 = 0.0
@@ -152,15 +153,13 @@ class GUIController(threading.Thread):
             self._handle_hotkeys(now)
 
             # 2. 定期同步游戏会话状态与当前英雄 (自适应频率)
-            interval = 1.2 if self.current_phase == "ChampSelect" else 2.5
+            interval = 1.2 if self.current_phase in ("ChampSelect", "GameStart") else 2.5
             if now - self._last_session_check > interval:
                 self._last_session_check = now
                 self._sync_session_and_hero()
 
             # 3. 局内自动检测海克斯弹窗 (高速采样 0.12s + 即时反馈 + Fast-Track)
-            if (self.auto_popup_enabled and 
-                self.current_hero and 
-                self.current_phase not in ("Lobby", "Matchmaking", "EndOfGame", "WaitingForStats")):
+            if self.auto_popup_enabled and self.current_hero and self.current_phase == "InProgress":
                 if now - self._last_popup_check > 0.12:
                     self._last_popup_check = now
                     self._check_in_game_popup()
@@ -215,6 +214,19 @@ class GUIController(threading.Thread):
         old_phase = self.current_phase
         self.current_phase = phase
 
+        if phase == "InProgress" and old_phase != "InProgress":
+            self._first_popup_pending = True
+        if old_phase == "InProgress" and phase != "InProgress":
+            if self._overlay_is_showing:
+                self.overlay_queue.put({"cmd": "CLEAR"})
+            self._overlay_is_showing = False
+            self._prev_thumbnails = None
+            self._last_matched_thumbs = None
+            self._negative_thumbs = None
+            self._last_results = {}
+            self._first_popup_pending = False
+            self._gui(event="status", status="listening")
+
         # 如果对局重置回到选人或大厅，解除手动锁定
         if phase in ("ChampSelect", "Lobby", "Matchmaking") and old_phase in ("InProgress", "GameStart"):
             self.is_manual_hero = False
@@ -259,8 +271,8 @@ class GUIController(threading.Thread):
                 if not is_same:
                     # 检查画面是否彻底离开了海克斯弹窗 (选完了卡牌进入战斗)
                     gate_pass, _ = self.analyzer.check_visual_gate(curr_thumbs)
-                    if not gate_pass:
-                        # 弹窗已消失 -> 立即清空遮罩
+                    if not gate_pass or len(diff_keys) == 3:
+                        # 丢弃旧结果，下一帧重新确认弹窗
                         self.overlay_queue.put({"cmd": "CLEAR"})
                         self._overlay_is_showing = False
                         self._last_matched_thumbs = None
@@ -268,18 +280,19 @@ class GUIController(threading.Thread):
                         self._prev_thumbnails = curr_thumbs
                         return
                     else:
-                        # 画面仍然具有文字特征，某张卡发生重掷/刷新 (Reroll):
-                        # 1. 立即在变动的卡牌上方浮现 "🎲 刷新识别中..." (0.05秒即时反馈)
-                        self.overlay_queue.put({"cmd": "RECOGNIZING", "keys": diff_keys})
-                        # 2. 仅对变动的卡执行单卡截图与局部增量分析 (耗时骤降 300%)
-                        diff_images = self.analyzer.capture_all_regions(target_keys=diff_keys)
-                        results = self.analyzer.analyze_partial(
-                            self.current_hero, diff_images, self._last_results, diff_keys
+                        refreshed = self.analyzer.analyze_stable_refresh(
+                            self.current_hero, curr_thumbs, self._last_results, diff_keys
                         )
-                        self._last_results = results
-                        self._last_matched_thumbs = curr_thumbs
-                        self.overlay_queue.put({"cmd": "UPDATE", "data": results, "duration": 20000})
-                        prev_thumbs = curr_thumbs
+                        if refreshed is not None and self.auto_popup_enabled:
+                            results, confirmed_thumbs, changed_keys = refreshed
+                            self._last_matched_thumbs.update(confirmed_thumbs)
+                            if changed_keys:
+                                self.overlay_queue.put({"cmd": "RECOGNIZING", "keys": changed_keys})
+                                time.sleep(0.3)
+                                if self.auto_popup_enabled:
+                                    self._last_results = results
+                                    self.overlay_queue.put({"cmd": "UPDATE", "data": results, "duration": 20000})
+                        self._prev_thumbnails = curr_thumbs
                         return
                 else:
                     # 缩略图完全一致，继续保持显示，跳过 OCR
@@ -299,14 +312,12 @@ class GUIController(threading.Thread):
             if is_neg_same:
                 return
 
-        # 3. 首次捕获到疑似海克斯弹窗 -> 立即浮现识别中提示 (消除用户等待盲区)
-        self.overlay_queue.put({"cmd": "RECOGNIZING"})
-        self._gui(event="status", status="analyzing", hero=self.current_hero)
-
-        # 4. Fast-Track 极速防抖确认 (60ms 等待弹窗完全展开)
+        # 视觉门控也会放行普通游戏画面，后台确认后才显示推荐
         time.sleep(0.06)
         confirm_images = self.analyzer.capture_all_regions()
         results = self.analyzer.analyze(self.current_hero, images=confirm_images)
+        if not self.auto_popup_enabled:
+            return
 
         # 判定是否属于有效的海克斯三选一弹窗:
         # 条件: 3 个卡牌区域中有效匹配到的海克斯数量 >= 2，且平均相似度 >= 65
@@ -316,16 +327,19 @@ class GUIController(threading.Thread):
             avg_score = sum(scores) / len(scores) if scores else 0
             if avg_score >= 65:
                 print(f"✨ 自动识别到海克斯选择弹窗! ({len(valid_items)}/3 卡牌已匹配, 平均匹配度: {avg_score:.1f})")
-                self.overlay_queue.put({"cmd": "UPDATE", "data": results, "duration": 20000})
+                self.overlay_queue.put({
+                    "cmd": "UPDATE", "data": results, "duration": 20000,
+                    "opening": self._first_popup_pending,
+                })
+                self._first_popup_pending = False
                 self._overlay_is_showing = True
                 self._last_results = results
-                self._last_matched_thumbs = curr_thumbs
+                self._last_matched_thumbs = self.analyzer.compute_thumbnails(confirm_images)
                 self._negative_thumbs = None
                 self._gui(event="status", status="auto_detected", hero=self.current_hero)
                 return
 
-        # 否则清除识别提示，并标记当前缩略图为负样本
-        self.overlay_queue.put({"cmd": "CLEAR"})
+        # 记录未通过 OCR 确认的画面，避免对相同画面重复识别
         self._negative_thumbs = curr_thumbs
 
 

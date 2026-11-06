@@ -24,6 +24,16 @@
 
 ---
 
+## 📖 开发者与接手文档导航 (Docs Navigation)
+
+本项目遵循严格的模块化与文档随行规范。下一个人或 AI 接手本仓库时，请优先查阅以下入口：
+
+* **[AGENTS.md](AGENTS.md)（长期技术约定）**: 系统全景架构、环境版本铁律 (Python 3.9~3.12)、两阶段视觉门控流水线算法、LCU/Live API 通信规范与自动化测试守则。
+* **[STATUS.md](STATUS.md)（现状与任务记录）**: 当前分支与状态、卡点边界与对策、下一步任务看板、关键架构决策 (ADR) 与避坑实录。
+* **[tests/test_auto_detect.py](tests/test_auto_detect.py)（自动化回归测试）**: 验证 LCU 英雄名解析、门控与单卡局部重算的一站式测试入口。
+
+---
+
 ## ⚠️ 核心前置条件 (Prerequisites)
 
 1.  **管理员身份运行**: 程序涉及全局热键监听和截取客户端进程信息，**建议以管理员身份**运行解压后的 `ARAMHelper.exe`（开发者请以管理员权限运行 Python 或所在终端）。
@@ -130,11 +140,17 @@
 
 ## 📂 文件结构说明
 
-* `main.py`: 主程序（GUI 遮罩、按键监听、程序逻辑）。
-* `scripts/lcu_connector.py`: 英雄联盟本地 API 通信模块。
-* `scripts/hero_scraper.py`: 爬虫脚本（基于 Selenium 抓取数据）。
-* `scripts/updater.py`: 数据同步工具（手动触发更新、合并数据）。
-* `data/hero_augments.csv`: 核心数据库。
+* `gui_launcher.py`: 现代化 GUI 启动器（GitHub Dark 主题、托盘后台控制、独立打包入口）。
+* `main.py`: 核心算法与悬浮窗实现（透明置顶遮罩、两阶段视觉门控、OCR 推理、状态控制）。
+* `build.py`: PyInstaller 一键轻量化打包脚本（依赖修剪、资源收集与目录隔离）。
+* `scripts/config.py`: 统一路径常量解析器（兼容源码与打包冻结运行环境）。
+* `scripts/lcu_connector.py`: 英雄联盟本地 LCU 与 Live Client Data API 通信模块。
+* `scripts/updater.py`: 四维数据自动同步与 GitHub 云端拉取工具。
+* `scripts/hero_scraper.py`: 基于 Selenium 的海克斯符文爬虫核心。
+* `data/hero_augments.csv`: 英雄海克斯胜率与梯队核心数据库。
+* `tests/test_auto_detect.py`: 自动化单元测试套件（覆盖英雄解析、门控与增量算法）。
+* `AGENTS.md`: 面向开发者/AI 的长期架构与开发约定。
+* `STATUS.md`: 当前任务进度、卡点边界、决策记录与踩坑复盘。
 
 ## 📄 License
 
