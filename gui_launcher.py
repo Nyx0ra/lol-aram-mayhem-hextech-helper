@@ -640,6 +640,7 @@ class LauncherApp:
         self._init_cancel = None
         self._update_running = False
         self._quit_after_update = False
+        self._update_cancel = None
         self.controller = None
         self.overlay = None
         self.overlay_window = None
@@ -1016,6 +1017,8 @@ class LauncherApp:
         if self._update_running:
             return
         self._update_running = True
+        self._update_cancel = threading.Event()
+        cancel_event = self._update_cancel
         self.update_btn.config(state=tk.DISABLED)
 
         mode_labels = {
@@ -1032,15 +1035,17 @@ class LauncherApp:
             try:
                 if mode == 'github':
                     from scripts.updater import download_from_github
-                    success = download_from_github(log_func=self._log_safe)
+                    success = download_from_github(log_func=self._log_safe, cancel_event=cancel_event)
                 elif mode == 'precise' and hero_names:
                     from scripts.updater import update_specific_heroes
-                    success = update_specific_heroes(hero_names, log_func=self._log_safe)
+                    success = update_specific_heroes(hero_names, log_func=self._log_safe, cancel_event=cancel_event)
                 else:
                     from scripts.updater import run_update
-                    success = run_update(mode=mode, log_func=self._log_safe)
+                    success = run_update(mode=mode, log_func=self._log_safe, cancel_event=cancel_event)
 
-                if success:
+                if cancel_event.is_set():
+                    self._log_safe("更新任务已停止，正在退出。")
+                elif success:
                     self._log_safe("✅ 更新完成!")
                     reload_data = True
                 else:
@@ -1181,6 +1186,7 @@ class LauncherApp:
     def _finish_update(self):
         if self._update_running:
             self._update_running = False
+            self._update_cancel = None
             if self._quit_after_update:
                 self._quit_app()
             else:
@@ -1310,7 +1316,11 @@ class LauncherApp:
         if self._update_running:
             if not self._quit_after_update:
                 self._quit_after_update = True
-                self._log("数据更新完成后将自动退出。")
+                if self._update_cancel is not None:
+                    self._update_cancel.set()
+                self._log("正在取消更新并退出，保留已保存的数据。")
+                self.root.withdraw()
+                self._engine_cleanup()
             return
         self._engine_cleanup()
         sys.stdout = self._orig_stdout

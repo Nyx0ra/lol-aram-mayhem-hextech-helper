@@ -20,6 +20,7 @@ from pypinyin import lazy_pinyin
 try:
     from scripts import hero_scraper as crawler
     from scripts.config import BASE_DIR, DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from scripts.update_control import UpdateCancelled, check_cancelled, wait_or_cancel
 except ImportError:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(current_dir)
@@ -29,6 +30,7 @@ except ImportError:
         sys.path.insert(0, current_dir)
     import hero_scraper as crawler
     from config import BASE_DIR, DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from update_control import UpdateCancelled, check_cancelled, wait_or_cancel
 
 # GitHub 仓库地址 (用于在线下载)
 GITHUB_RAW_BASE    = "https://raw.githubusercontent.com/Nyx0ra/lol-aram-mayhem-hextech-helper/main"
@@ -324,55 +326,87 @@ def sync_data_to_github(log_func=None, quiet_if_unchanged=False):
         return False
 
 # ================= 1. 数据真理同步 =================
-def sync_official_data():
+def sync_official_data(cancel_event=None):
     print(">>> [1/4] 正在同步官方英雄数据...")
+    # 海克斯抓取只需要英雄映射；官方 CDN 暂时不可达时，不应阻断更新。
+    for attempt in range(2):
+        try:
+            check_cancelled(cancel_event)
+            ver_url = "https://ddragon.leagueoflegends.com/api/versions.json"
+            response = requests.get(ver_url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            check_cancelled(cancel_event)
+            versions = response.json()
+            if not isinstance(versions, list) or not versions or not isinstance(versions[0], str) or not versions[0].strip():
+                raise ValueError("官方版本列表格式无效")
+            version = versions[0]
+            print(f"    当前游戏版本: {version}")
+
+            champ_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/zh_CN/champion.json"
+            response = requests.get(champ_url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            check_cancelled(cancel_event)
+            data = response.json()['data']
+            if not isinstance(data, dict) or not data:
+                raise ValueError("官方英雄列表为空或格式无效")
+
+            official_en_to_cn = {}
+            for en_id, info in data.items():
+                if en_id.startswith('Jade_'):
+                    continue
+                cn_name = info['name']
+                if not en_id.strip() or not isinstance(cn_name, str) or not cn_name.strip():
+                    raise ValueError("官方英雄名称格式无效")
+                official_en_to_cn[en_id] = cn_name
+            official_cn_to_en = {cn: en for en, cn in official_en_to_cn.items()}
+            if not official_en_to_cn or len(official_cn_to_en) != len(official_en_to_cn):
+                raise ValueError("官方英雄映射为空或存在重复名称")
+            break
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            check_cancelled(cancel_event)
+            if attempt == 0:
+                print(f"    官方连接暂未就绪，正在自动重试 (1/2，{type(e).__name__})...")
+                wait_or_cancel(1, cancel_event)
+            else:
+                print(f"    ⚠ 官方数据两次请求均未成功，正在检查本地缓存: {e}")
+    else:
+        try:
+            csv_bytes = Path(CSV_FILE).read_bytes()
+            champions_bytes = Path(CHAMPION_ID_FILE).read_bytes()
+            pinyin_bytes = Path(PINYIN_FILE).read_bytes()
+            _validate_dataset(csv_bytes, champions_bytes, pinyin_bytes)
+            cached_cn_to_en = json.loads(champions_bytes.decode("utf-8-sig"))
+        except (OSError, ValueError, TypeError, AttributeError, csv.Error) as e:
+            print(f"!!! 官方数据不可用，且本地数据无法通过校验: {e}")
+            print("    请检查网络，或使用「GitHub 备选下载」恢复数据后重试。")
+            return {}, {}, [], []
+        print(f"    ⚠ 官方数据暂不可用，使用本地已校验的 {len(cached_cn_to_en)} 个英雄继续更新海克斯；本次无法检查新英雄或改名。")
+        return {en: cn for cn, en in cached_cn_to_en.items()}, cached_cn_to_en, [], []
+
     try:
-        ver_url = "https://ddragon.leagueoflegends.com/api/versions.json"
-        response = requests.get(ver_url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        version = response.json()[0]
-        print(f"    当前游戏版本: {version}")
-
-        champ_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/zh_CN/champion.json"
-        response = requests.get(champ_url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()['data']
-
-        official_en_to_cn = {}
-        official_cn_to_en = {}
-        for en_id, info in data.items():
-            if en_id.startswith('Jade_'):
-                continue
-            cn_name = info['name']
-            official_en_to_cn[en_id] = cn_name
-            official_cn_to_en[cn_name] = en_id
-
         old_en_to_cn = {}
         if os.path.exists(CHAMPION_ID_FILE):
             with open(CHAMPION_ID_FILE, 'r', encoding='utf-8') as f:
                 old_cn_to_en = json.load(f)
                 old_en_to_cn = {en: cn for cn, en in old_cn_to_en.items()}
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        print(f"    ⚠ 本地英雄映射无法用于差异比较，将使用官方数据重建: {e}")
+        old_en_to_cn = {}
 
-        new_champs = []
-        renamed_champs =[]
-        
-        for en_id, cn_name in official_en_to_cn.items():
-            if en_id not in old_en_to_cn:
-                new_champs.append(en_id)
-            elif old_en_to_cn[en_id] != cn_name:
-                renamed_champs.append(en_id)
-        
-        print(f"    同步完成。共 {len(official_en_to_cn)} 个英雄。")
-        if new_champs:
-            print(f"    🌟 发现 {len(new_champs)} 个全新英雄: {', '.join([official_en_to_cn[en] for en in new_champs])}")
-        if renamed_champs:
-            print(f"    ✏️ 发现 {len(renamed_champs)} 个改名英雄: {', '.join([official_en_to_cn[en] for en in renamed_champs])}")
-            
-        return official_en_to_cn, official_cn_to_en, new_champs, renamed_champs
+    new_champs = []
+    renamed_champs = []
+    for en_id, cn_name in official_en_to_cn.items():
+        if en_id not in old_en_to_cn:
+            new_champs.append(en_id)
+        elif old_en_to_cn[en_id] != cn_name:
+            renamed_champs.append(en_id)
 
-    except Exception as e:
-        print(f"!!! 官方数据同步失败，请检查网络: {e}")
-        return {}, {}, [],[]
+    print(f"    同步完成。共 {len(official_en_to_cn)} 个英雄。")
+    if new_champs:
+        print(f"    🌟 发现 {len(new_champs)} 个全新英雄: {', '.join([official_en_to_cn[en] for en in new_champs])}")
+    if renamed_champs:
+        print(f"    ✏️ 发现 {len(renamed_champs)} 个改名英雄: {', '.join([official_en_to_cn[en] for en in renamed_champs])}")
+    return official_en_to_cn, official_cn_to_en, new_champs, renamed_champs
 
 # ================= 2. 拼音生成 =================
 def _pinyin_mapping(official_cn_to_en):
@@ -512,7 +546,7 @@ def compare_hero_data(history_rows, crawled_items):
     
     return local_set != remote_set
 
-def spot_check_and_update(official_en_to_cn, history_data, sample_size=3):
+def spot_check_and_update(official_en_to_cn, history_data, sample_size=3, cancel_event=None):
     """随机抽取英雄进行抽样比对，一旦发现有差异立即触发全量更新"""
     all_en_names = list(official_en_to_cn.keys())
     # 优先从有历史数据的英雄中抽样，这样比对才有意义
@@ -547,7 +581,7 @@ def spot_check_and_update(official_en_to_cn, history_data, sample_size=3):
             print(f"    ✅ [{cn_name}] 数据一致")
             return False
 
-    sample_data, failed = crawler.crawl_champions(sample_list, early_stop_func=check_diff_callback)
+    sample_data, failed = crawler.crawl_champions(sample_list, early_stop_func=check_diff_callback, cancel_event=cancel_event)
     
     if failed:
         print(f"\n⚠️ 抽样爬取失败的英雄: {failed}，跳过失败英雄继续比对。")
@@ -596,7 +630,7 @@ def main():
 
 # ================= GUI API 接口 =================
 
-def run_update(mode='smart', log_func=None, official_data=None):
+def run_update(mode='smart', log_func=None, official_data=None, cancel_event=None):
     """
     供 GUI 和 CLI 调用的统一更新接口。
     
@@ -612,16 +646,17 @@ def run_update(mode='smart', log_func=None, official_data=None):
     _log = log_func or print
     
     try:
+        check_cancelled(cancel_event)
         # 1. 同步官方数据 (或使用已有数据)
         if official_data:
             official_en_to_cn, official_cn_to_en, new_champs, renamed_champs = official_data
         else:
             _log("正在同步官方英雄数据...")
-            official_en_to_cn, official_cn_to_en, new_champs, renamed_champs = sync_official_data()
+            official_en_to_cn, official_cn_to_en, new_champs, renamed_champs = sync_official_data(cancel_event=cancel_event)
             if not official_en_to_cn:
                 _log("❌ 官方数据同步失败")
                 return False
-            _log(f"✅ 同步完成: {len(official_en_to_cn)} 个英雄")
+            _log(f"✅ 英雄映射已就绪: {len(official_en_to_cn)} 个英雄")
         
         # 2. 加载历史数据
         history_data = load_csv_history()
@@ -636,7 +671,7 @@ def run_update(mode='smart', log_func=None, official_data=None):
         
         elif mode == 'spot_check':
             _log("模式: 抽样校验")
-            has_diff, sample_data = spot_check_and_update(official_en_to_cn, history_data)
+            has_diff, sample_data = spot_check_and_update(official_en_to_cn, history_data, cancel_event=cancel_event)
             if not sample_data and official_en_to_cn:
                 _log("❌ 抽样校验失败: 未能成功抓取任何抽样英雄数据，请检查网络")
                 return False
@@ -668,7 +703,7 @@ def run_update(mode='smart', log_func=None, official_data=None):
         # 4. 执行爬取
         if target_list:
             _log(f"准备爬取 {len(target_list)} 个英雄...")
-            crawled_data, failed_list = crawler.crawl_champions(target_list)
+            crawled_data, failed_list = crawler.crawl_champions(target_list, cancel_event=cancel_event)
             new_crawl_data.update(crawled_data)
             if failed_list:
                 _log(f"⚠ 爬取失败的英雄: {', '.join(failed_list)}")
@@ -679,18 +714,22 @@ def run_update(mode='smart', log_func=None, official_data=None):
             _log("无需爬取")
         
         # 5. 合并保存
+        check_cancelled(cancel_event)
         if not merge_and_save(official_en_to_cn, history_data, new_crawl_data):
             return False
         _log("✅ 数据合并保存完成")
-        sync_data_to_github(log_func=_log, quiet_if_unchanged=False)
+        if cancel_event is None or not cancel_event.is_set():
+            sync_data_to_github(log_func=_log, quiet_if_unchanged=False)
         return True
-        
+    except UpdateCancelled:
+        _log("更新已取消，未提交的抓取结果已丢弃，原数据保留。")
+        return False
     except Exception as e:
         _log(f"❌ 更新失败: {e}")
         return False
 
 
-def download_from_github(log_func=None):
+def download_from_github(log_func=None, cancel_event=None):
     """
     从 GitHub 仓库下载最新数据文件。
     
@@ -713,12 +752,17 @@ def download_from_github(log_func=None):
     
     try:
         for idx, (remote_path, desc) in enumerate(files_to_download, 1):
+            check_cancelled(cancel_event)
             _log(f"下载中 [{idx}/{total}]: {desc}...")
             resp = requests.get(f"{GITHUB_RAW_BASE}/{remote_path}", timeout=REQUEST_TIMEOUT)
             if resp.status_code != 200:
                 raise ValueError(f"{desc} 下载失败 (HTTP {resp.status_code})")
             contents.append(resp.content)
+        check_cancelled(cancel_event)
         _save_dataset(*contents)
+    except UpdateCancelled:
+        _log("下载已取消，原数据保留。")
+        return False
     except Exception as e:
         _log(f"❌ 下载更新失败: {e}")
         return False
@@ -726,7 +770,7 @@ def download_from_github(log_func=None):
     return True
 
 
-def update_specific_heroes(hero_names, log_func=None):
+def update_specific_heroes(hero_names, log_func=None, cancel_event=None):
     """
     精确更新指定英雄的数据。
     
@@ -741,7 +785,7 @@ def update_specific_heroes(hero_names, log_func=None):
     
     try:
         _log("正在同步官方英雄数据...")
-        official_en_to_cn, official_cn_to_en, _, _ = sync_official_data()
+        official_en_to_cn, official_cn_to_en, _, _ = sync_official_data(cancel_event=cancel_event)
         if not official_en_to_cn:
             _log("❌ 官方数据同步失败")
             return False
@@ -789,7 +833,7 @@ def update_specific_heroes(hero_names, log_func=None):
         
         _log(f"准备爬取 {len(target_list)} 个英雄...")
         history_data = load_csv_history()
-        new_crawl_data, failed_list = crawler.crawl_champions(target_list)
+        new_crawl_data, failed_list = crawler.crawl_champions(target_list, cancel_event=cancel_event)
         
         if failed_list:
             _log(f"⚠ 爬取失败: {', '.join(failed_list)}")
@@ -798,12 +842,16 @@ def update_specific_heroes(hero_names, log_func=None):
             _log("❌ 指定英雄爬取失败，未更新数据")
             return False
 
+        check_cancelled(cancel_event)
         if not merge_and_save(official_en_to_cn, history_data, new_crawl_data):
             return False
         _log("✅ 精确更新完成")
-        sync_data_to_github(log_func=_log, quiet_if_unchanged=False)
+        if cancel_event is None or not cancel_event.is_set():
+            sync_data_to_github(log_func=_log, quiet_if_unchanged=False)
         return True
-        
+    except UpdateCancelled:
+        _log("更新已取消，未提交的抓取结果已丢弃，原数据保留。")
+        return False
     except Exception as e:
         _log(f"❌ 更新失败: {e}")
         return False

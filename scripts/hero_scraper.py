@@ -9,6 +9,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
+try:
+    from scripts.update_control import UpdateCancelled, check_cancelled, wait_or_cancel
+except ImportError:
+    from update_control import UpdateCancelled, check_cancelled, wait_or_cancel
 
 # ==========================================
 # ChromeDriver 查找与初始化
@@ -85,6 +89,12 @@ def setup_driver():
     chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
     driver = _init_driver_with_fallback(chrome_options)
+    try:
+        driver.set_page_load_timeout(15)
+        driver.set_script_timeout(10)
+    except Exception:
+        driver.quit()
+        raise
 
     # 不设置隐式等待，全部使用显式等待 (WebDriverWait)，避免超时累加
     return driver
@@ -129,20 +139,27 @@ _JS_DISMISS_POPUP = """
 # ==========================================
 # 从当前页面提取海克斯名称列表（JS批量提取）
 # ==========================================
-def extract_augment_names_fast(driver):
+def _wait_for_augments(driver, seconds, cancel_event):
+    def ready(browser):
+        check_cancelled(cancel_event)
+        return EC.presence_of_element_located((By.CSS_SELECTOR, _AUGMENT_SELECTOR))(browser)
+    return WebDriverWait(driver, seconds).until(ready)
+
+
+def extract_augment_names_fast(driver, cancel_event=None):
     """用单次 JS 调用批量提取当前 Tab 下所有海克斯名称"""
     try:
         # 等待至少一个海克斯元素出现
-        WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, _AUGMENT_SELECTOR))
-        )
+        _wait_for_augments(driver, 8, cancel_event)
         # 短暂等待确保 DOM 更新完成（Tab 切换后内容渲染）
-        time.sleep(0.3)
+        wait_or_cancel(0.3, cancel_event)
         # 单次 JS 调用提取所有名称，避免逐个 element.text 的 round-trip
         names = driver.execute_script(_JS_EXTRACT_NAMES)
         return names if names else []
     except TimeoutException:
         return []
+    except UpdateCancelled:
+        raise
     except Exception as e:
         print(f"   > 提取海克斯名称异常: {e}")
         return []
@@ -150,12 +167,13 @@ def extract_augment_names_fast(driver):
 # ==========================================
 # 点击 Tab 并等待内容刷新
 # ==========================================
-def click_tab_and_wait(driver, tab_text, prev_names=None):
+def click_tab_and_wait(driver, tab_text, prev_names=None, cancel_event=None):
     """
     点击指定 Tab 并智能等待内容刷新。
     通过对比前后内容变化来判断刷新完成，而非固定等待。
     """
     try:
+        check_cancelled(cancel_event)
         clicked = driver.execute_script(_JS_CLICK_TAB, tab_text)
         if not clicked:
             print(f"   > 未找到按钮: {tab_text}")
@@ -164,15 +182,17 @@ def click_tab_and_wait(driver, tab_text, prev_names=None):
         if prev_names is not None:
             # 智能等待：等内容变化或最多 3 秒
             for _ in range(15):
-                time.sleep(0.2)
+                wait_or_cancel(0.2, cancel_event)
                 current = driver.execute_script(_JS_EXTRACT_NAMES)
                 if current != prev_names:
                     return True
             # 超时也返回 True，可能内容就是相同的
         else:
-            time.sleep(0.5)  # 首次无对比基准，短暂等待即可
+            wait_or_cancel(0.5, cancel_event)  # 首次无对比基准，短暂等待即可
 
         return True
+    except UpdateCancelled:
+        raise
     except Exception as e:
         print(f"   > 点击Tab异常 ({tab_text}): {e}")
         return False
@@ -180,16 +200,15 @@ def click_tab_and_wait(driver, tab_text, prev_names=None):
 # ==========================================
 # 单个英雄抓取逻辑 (数据源: OP.GG) — 优化版
 # ==========================================
-def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
+def scrape_single_champion(driver, cn_name, en_name, is_first_page=False, cancel_event=None):
     url = f"https://op.gg/zh-cn/lol/modes/aram-mayhem/{en_name}/augments"
     print(f"[{cn_name}] 正在处理: {url}")
 
     try:
+        check_cancelled(cancel_event)
         driver.get(url)
         # 等待海克斯列表出现（而非仅等 body 标签）
-        WebDriverWait(driver, 12).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, _AUGMENT_SELECTOR))
-        )
+        _wait_for_augments(driver, 12, cancel_event)
 
         # 仅首页处理弹窗（cookie 同意在 session 内只出现一次）
         if is_first_page:
@@ -197,13 +216,13 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
                 driver.execute_script(_JS_DISMISS_POPUP)
             except:
                 pass
-            time.sleep(0.3)
+            wait_or_cancel(0.3, cancel_event)
 
         # 1. 提取「全部」Tab 数据（页面默认就是全部 Tab）
         print(f"   > 提取「全部」排名...")
         # 先确保在全部 Tab
-        click_tab_and_wait(driver, "全部")
-        all_names = extract_augment_names_fast(driver)
+        click_tab_and_wait(driver, "全部", cancel_event=cancel_event)
+        all_names = extract_augment_names_fast(driver, cancel_event=cancel_event)
         print(f"   > 「全部」共 {len(all_names)} 个")
 
         # 构建总排名映射
@@ -223,8 +242,8 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
         }
 
         for internal_tier, tab_name in tier_mapping.items():
-            if click_tab_and_wait(driver, tab_name, prev_names):
-                tier_names = extract_augment_names_fast(driver)
+            if click_tab_and_wait(driver, tab_name, prev_names, cancel_event=cancel_event):
+                tier_names = extract_augment_names_fast(driver, cancel_event=cancel_event)
                 print(f"   > 「{internal_tier}」共 {len(tier_names)} 个")
                 for idx, name in enumerate(tier_names, 1):
                     if name not in tier_data:
@@ -262,6 +281,8 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
         status_code = "clean" if valid_augments else "empty"
         return valid_augments, status_code
 
+    except UpdateCancelled:
+        raise
     except Exception as e:
         print(f"[{cn_name}] 异常: {e}")
         return [], "error"
@@ -269,13 +290,14 @@ def scrape_single_champion(driver, cn_name, en_name, is_first_page=False):
 # ==========================================
 # 批量抓取入口
 # ==========================================
-def crawl_champions(target_list, early_stop_func=None):
+def crawl_champions(target_list, early_stop_func=None, cancel_event=None):
     """
     直接返回内存字典，不再写临时文件
     early_stop_func: 接收 (cn_name, crawled_data) 返回 bool，若返回 True 则提前终止抓取
     """
     print(f"--- 开始抓取 {len(target_list)} 个英雄 ---")
 
+    check_cancelled(cancel_event)
     driver = setup_driver()
     failed_list = []
     success_data = {}
@@ -286,6 +308,7 @@ def crawl_champions(target_list, early_stop_func=None):
     try:
         total = len(target_list)
         for i, (cn_name, en_name) in enumerate(target_list, 1):
+            check_cancelled(cancel_event)
             print(f"--- 进度 [{i}/{total}] : {cn_name} ---")
 
             # 定期重启浏览器释放内存（间隔从 15 提升到 30）
@@ -298,7 +321,9 @@ def crawl_champions(target_list, early_stop_func=None):
             is_first = (i == 1)
 
             for attempt in range(1, MAX_RETRIES + 1):
-                data, status = scrape_single_champion(driver, cn_name, en_name, is_first_page=is_first)
+                check_cancelled(cancel_event)
+                data, status = scrape_single_champion(driver, cn_name, en_name, is_first_page=is_first, cancel_event=cancel_event)
+                check_cancelled(cancel_event)
                 is_first = False  # 弹窗只需第一次处理
 
                 if status == "clean" and data:
@@ -318,7 +343,7 @@ def crawl_champions(target_list, early_stop_func=None):
                         driver = setup_driver()
 
                 if attempt < MAX_RETRIES:
-                    time.sleep(1)
+                    wait_or_cancel(1, cancel_event)
                 else:
                     print(f"   > ❌ {cn_name} 失败")
                     failed_list.append(cn_name)
@@ -328,7 +353,7 @@ def crawl_champions(target_list, early_stop_func=None):
                 break
 
             # 英雄间短暂间隔，避免被反爬
-            time.sleep(random.uniform(0.3, 0.8))
+            wait_or_cancel(random.uniform(0.3, 0.8), cancel_event)
 
     finally:
         driver.quit()

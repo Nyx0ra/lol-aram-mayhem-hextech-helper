@@ -1,6 +1,7 @@
 """Regression coverage for launcher lifecycle and updater persistence."""
 
 import queue
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,6 +13,20 @@ from scripts import updater
 
 
 class LauncherTests(unittest.TestCase):
+    def test_close_during_update_cancels_and_hides_window(self):
+        app = LauncherApp.__new__(LauncherApp)
+        app._update_running = True
+        app._quit_after_update = False
+        app._update_cancel = threading.Event()
+        app._log = Mock()
+        app._engine_cleanup = Mock()
+        app.root = Mock()
+        app._quit_app()
+        self.assertTrue(app._update_cancel.is_set())
+        self.assertTrue(app._quit_after_update)
+        app.root.withdraw.assert_called_once()
+        app._engine_cleanup.assert_called_once()
+
     def test_reloaded_data_reaches_running_engine_and_clears_overlay(self):
         old_data = Mock()
         new_data = Mock()
@@ -130,6 +145,97 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(get.call_count, 2)
         for call in get.call_args_list:
             self.assertEqual(call.kwargs["timeout"], updater.REQUEST_TIMEOUT)
+
+    def _write_valid_cache(self):
+        self.paths[0].write_text(
+            "中文名,英文名,等级,总排名,等级内序号,海克斯名称\n"
+            "探险家,Ezreal,黄金,1,1,贪欲束缚\n", encoding="utf-8-sig",
+        )
+        self.paths[1].write_text('{"探险家": "Ezreal"}', encoding="utf-8")
+        self.paths[2].write_text('{"探险家": "txj"}', encoding="utf-8")
+
+    def test_official_timeout_retries_before_using_cache(self):
+        self.paths[1].write_text('{"探险家": "Ezreal"}', encoding="utf-8")
+        replies = [
+            updater.requests.exceptions.ReadTimeout("slow official server"),
+            Mock(json=Mock(return_value=["test-version"])),
+            Mock(json=Mock(return_value={"data": {"Ahri": {"name": "九尾妖狐"}}})),
+        ]
+        with patch.object(updater.requests, "get", side_effect=replies), patch.object(updater.time, "sleep"):
+            en_to_cn, _, added, _ = updater.sync_official_data()
+        self.assertEqual(en_to_cn, {"Ahri": "九尾妖狐"})
+        self.assertEqual(added, ["Ahri"])
+
+    def test_official_unavailable_uses_valid_cache_without_writing(self):
+        self._write_valid_cache()
+        previous = [path.read_bytes() for path in self.paths]
+        with patch.object(updater.requests, "get", side_effect=updater.requests.exceptions.ReadTimeout("offline")), \
+                patch.object(updater.time, "sleep"), patch("builtins.print") as log:
+            result = updater.sync_official_data()
+        self.assertEqual(result, ({"Ezreal": "探险家"}, {"探险家": "Ezreal"}, [], []))
+        self.assertEqual([path.read_bytes() for path in self.paths], previous)
+        self.assertTrue(any("本地" in str(call) and "新英雄" in str(call) for call in log.call_args_list))
+
+    def test_official_unavailable_rejects_invalid_cache(self):
+        for invalid in (b"<html>", b"{}", b"[]", b'{"Bad": 1}', b'{"A": "Ezreal", "B": "Ezreal"}'):
+            with self.subTest(cache=invalid):
+                self._write_valid_cache()
+                self.paths[1].write_bytes(invalid)
+                previous = [path.read_bytes() for path in self.paths]
+                with patch.object(updater.requests, "get", side_effect=updater.requests.exceptions.ConnectionError("offline")), \
+                        patch.object(updater.time, "sleep"):
+                    self.assertEqual(updater.sync_official_data(), ({}, {}, [], []))
+                self.assertEqual([path.read_bytes() for path in self.paths], previous)
+
+    def test_invalid_official_response_uses_cache(self):
+        for payload in ({"data": {}}, {"data": {"Ezreal": {"name": ""}}}, {"data": []}):
+            with self.subTest(payload=payload):
+                self._write_valid_cache()
+                def reply(url, **kwargs):
+                    return Mock(json=Mock(return_value=["test-version"] if "/api/" in url else payload))
+                with patch.object(updater.requests, "get", side_effect=reply), patch.object(updater.time, "sleep"):
+                    result = updater.sync_official_data()
+                self.assertEqual(result, ({"Ezreal": "探险家"}, {"探险家": "Ezreal"}, [], []))
+
+    def test_update_continues_after_official_timeout(self):
+        self._write_valid_cache()
+        rows = {"探险家": [{"name": "新海克斯", "tier": "黄金", "overall_rank": 1, "t_rank": 1}]}
+        with patch.object(updater.requests, "get", side_effect=updater.requests.exceptions.ReadTimeout("offline")), \
+                patch.object(updater.time, "sleep"), \
+                patch.object(updater.crawler, "crawl_champions", return_value=(rows, [])), \
+                patch.object(updater, "sync_data_to_github"):
+            self.assertTrue(updater.run_update(mode="full", log_func=Mock()))
+        self.assertIn("新海克斯", self.paths[0].read_text(encoding="utf-8-sig"))
+
+    def test_cancelled_crawl_does_not_commit_partial_update(self):
+        self._write_valid_cache()
+        previous = [p.read_bytes() for p in self.paths]
+        cancel = threading.Event()
+        def crawl(*args, **kwargs):
+            cancel.set()
+            return {"探险家": [{"name": "部分结果", "tier": "黄金", "overall_rank": 1, "t_rank": 1}]}, []
+        with patch.object(updater.crawler, "crawl_champions", side_effect=crawl), \
+                patch.object(updater, "sync_data_to_github") as sync:
+            self.assertFalse(updater.run_update(
+                mode="full", official_data=({"Ezreal": "探险家"}, {"探险家": "Ezreal"}, [], []),
+                cancel_event=cancel, log_func=Mock(),
+            ))
+        self.assertEqual([p.read_bytes() for p in self.paths], previous)
+        sync.assert_not_called()
+
+    def test_crawler_cancellation_stops_remaining_heroes_and_closes_browser(self):
+        cancel = threading.Event()
+        driver = Mock()
+        def scrape(*args, **kwargs):
+            cancel.set()
+            return [], "error"
+        with patch.object(updater.crawler, "setup_driver", return_value=driver), \
+                patch.object(updater.crawler, "scrape_single_champion", side_effect=scrape) as scrape_mock:
+            with self.assertRaises(Exception) as raised:
+                updater.crawler.crawl_champions([("探险家", "Ezreal"), ("九尾妖狐", "Ahri")], cancel_event=cancel)
+        self.assertEqual(type(raised.exception).__name__, "UpdateCancelled")
+        self.assertEqual(scrape_mock.call_count, 1)
+        driver.quit.assert_called_once()
 
 
 if __name__ == "__main__":
