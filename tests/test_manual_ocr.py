@@ -1,16 +1,10 @@
-import json
-import queue
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import cv2
 import numpy as np
 
-from gui_launcher import GUIController
 from main import DataManager, GameAnalyzer
 from scripts.window_layout import CARD_LEFTS, GameLayout, ScreenRect
 
@@ -67,38 +61,6 @@ class ManualOCRTests(unittest.TestCase):
         self.assertFalse(result["valid"])
         self.assertNotIn("match_name", result)
 
-    def test_f6_diagnostics_are_opt_in_and_save_actual_ocr_inputs(self):
-        layout = GameLayout(1, ScreenRect(-2560, 20, 2560, 1440))
-        expanded = np.zeros((176, 640), dtype=np.uint8)
-        expanded[40:100, 80:160] = 120
-        controller = GUIController(queue.Queue(), queue.Queue(), self.analyzer.dm, self.analyzer, None)
-        controller.current_hero = "英雄"
-        self.analyzer.ocr = lambda image: (
-            ([ocr_box("心灵净化"), ocr_box("伤害", top=82, height=16)] if image.shape[0] == 176 else None),
-            None)
-
-        with TemporaryDirectory() as temp, \
-                patch("gui_launcher.F6_DIAGNOSTICS_DIR", Path(temp), create=True), \
-                patch("gui_launcher.keyboard.is_pressed", side_effect=lambda key: key == "f6"), \
-                patch.object(self.analyzer, "capture_window_frame", return_value=(layout, {"hex_1": expanded})):
-            controller._handle_hotkeys(2.0)
-            self.assertEqual(list(Path(temp).iterdir()), [])
-            controller.save_f6_diagnostics = True
-            controller._handle_hotkeys(4.0)
-            bundles = list(Path(temp).iterdir())
-            self.assertEqual(len(bundles), 1)
-            report = json.loads((bundles[0] / "report.json").read_text(encoding="utf-8"))
-            card = report["cards"]["hex_1"]
-            self.assertEqual(report["hero"], "英雄")
-            self.assertEqual(card["title_region"]["height"], 74)
-            self.assertEqual(card["result"]["match_name"], "心灵净化")
-            self.assertEqual(card["attempts"][0]["ocr"], [])
-            self.assertEqual([box["text"] for box in card["attempts"][1]["ocr"]], ["心灵净化", "伤害"])
-            for attempt, expected in zip(card["attempts"], (expanded[28:],
-                    cv2.normalize(expanded, None, 0, 255, cv2.NORM_MINMAX))):
-                encoded = np.frombuffer((bundles[0] / attempt["image"]).read_bytes(), np.uint8)
-                np.testing.assert_array_equal(cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE), expected)
-
     def test_f6_retries_only_failed_cards_from_same_capture(self):
         layout = GameLayout(1, ScreenRect(-2560, 20, 2560, 1440))
         frame = np.zeros((1440, 2560, 4), dtype=np.uint8)
@@ -133,6 +95,10 @@ class ManualOCRTests(unittest.TestCase):
                     self.assertEqual([row.get("match_name") for row in result.values()],
                                      ["心灵净化", "珠光护手", "心灵净化"])
                     self.assertEqual([row["highlight"] for row in result.values()], [True, False, True])
+                    self.assertCountEqual(
+                        [call.args[0].shape for call in self.analyzer.ocr.call_args_list],
+                        [(148, 640)] * 3 + [(176, 640)],
+                    )
                     self.assertEqual(self.analyzer.ocr.call_count, 4)
                     capture.assert_called_once()
 

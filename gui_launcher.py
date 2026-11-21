@@ -16,7 +16,7 @@ import traceback
 
 # ============ 路径初始化 (兼容 PyInstaller 打包) ============
 
-from scripts.config import get_base_dir, BASE_DIR, F6_DIAGNOSTICS_DIR
+from scripts.config import get_base_dir, BASE_DIR
 from scripts.window_layout import has_recognition_overlay
 os.chdir(BASE_DIR)
 sys.path.insert(0, BASE_DIR)
@@ -109,7 +109,6 @@ class GUIController(threading.Thread):
         self.current_phase = "Unknown"
         self.is_manual_hero = False
         self.auto_popup_enabled = auto_popup
-        self.save_f6_diagnostics = False
         self.running = True
 
         from main import PopupDetector
@@ -231,10 +230,7 @@ class GUIController(threading.Thread):
             else:
                 self._gui(event="status", status="analyzing", hero=self.current_hero)
                 self.overlay_queue.put({"cmd": "STATUS", "data": f"🔎 分析 [{self.current_hero}]...", "duration": 1500})
-                if self.save_f6_diagnostics:
-                    message = self.analyzer.manual_update(self.current_hero, diagnostic_dir=F6_DIAGNOSTICS_DIR)
-                else:
-                    message = self.analyzer.manual_update(self.current_hero)
+                message = self.analyzer.manual_update(self.current_hero)
                 self.detector.reset(opening=self.detector.opening)
                 self.overlay_queue.put(message)
                 self._overlay_is_showing = message["cmd"] == "UPDATE"
@@ -671,7 +667,6 @@ class LauncherApp:
         # UI 变量
         self.hero_var = tk.StringVar(value="—")
         self.status_var = tk.StringVar(value="等待启动")
-        self.f6_diagnostics_var = tk.BooleanVar(value=False)
         self.status_color = self.TEXT_DIM
         self._pulse_state = 0
 
@@ -737,10 +732,6 @@ class LauncherApp:
         s.map('Link.TButton',
               foreground=[('active', self.ACCENT)],
               background=[('active', self.BG)])
-
-        s.configure('Diagnostics.TCheckbutton', background=self.BG, foreground=self.TEXT_DIM,
-                    font=self.FONT_SUB)
-        s.map('Diagnostics.TCheckbutton', background=[('active', self.BG)])
 
     # ==========================================
     # 构建 UI
@@ -831,10 +822,6 @@ class LauncherApp:
             tk.Label(inner, text=desc, font=("Microsoft YaHei", 9),
                      fg=self.TEXT_DIM, bg=self.BG_CARD).pack(side=tk.LEFT)
 
-        ttk.Checkbutton(main, text="保存 F6 诊断（标题截图和 OCR 结果）",
-                        variable=self.f6_diagnostics_var, command=self._toggle_f6_diagnostics,
-                        style='Diagnostics.TCheckbutton').pack(anchor=tk.W, pady=(0, 8))
-
         # ---- 按钮区域 ----
         btn_frame = tk.Frame(main, bg=self.BG)
         btn_frame.pack(fill=tk.X, pady=(0, 12))
@@ -906,13 +893,6 @@ class LauncherApp:
     # 引擎控制
     # ==========================================
 
-    def _toggle_f6_diagnostics(self):
-        enabled = self.f6_diagnostics_var.get()
-        if self.controller is not None:
-            self.controller.save_f6_diagnostics = enabled
-        if enabled:
-            self._log(f"F6 诊断目录：{F6_DIAGNOSTICS_DIR}")
-
     def _start_engine(self):
         """启动识别引擎"""
         if self.engine_running or self.engine_starting:
@@ -982,7 +962,6 @@ class LauncherApp:
                 self.overlay.queue, self.gui_queue, analyzer.dm, analyzer, lcu,
                 generation=self._engine_generation,
             )
-            controller.save_f6_diagnostics = self.f6_diagnostics_var.get()
             if analyzer.dm is not self.dm:
                 controller.data_updates.put(self.dm)
             controller.start()

@@ -19,7 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from thefuzz import process, fuzz
 from scripts.config import BASE_DIR, DATA_DIR
-from scripts.f6_diagnostics import save_f6_diagnostics
 from scripts.lcu_connector import LCUConnector, SessionPoller
 from scripts.overlay_inbox import OverlayInbox
 from scripts.window_layout import (
@@ -328,7 +327,7 @@ class GameAnalyzer:
         gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
         return cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
 
-    def manual_update(self, hero, *, diagnostic_dir=None):
+    def manual_update(self, hero):
         capture_started = time.perf_counter()
         layout, expanded = self.capture_window_frame(expanded=True)
         if layout is None:
@@ -339,22 +338,14 @@ class GameAnalyzer:
             title = layout.f6_title_region(key)
             images[key] = image[-title.height * 2:]
         captured = time.perf_counter()
-        traces = {key: [] for key in images} if diagnostic_dir is not None else None
-        results = self.analyze(hero, images=images, retry_images=expanded, traces=traces)
-        if traces is not None:
-            try:
-                path = save_f6_diagnostics(diagnostic_dir, hero, layout, expanded, traces, results,
-                                           ("manual", capture_started, captured, time.perf_counter()))
-                print(f"F6 诊断已保存：{path}")
-            except (OSError, cv2.error) as exc:
-                print(f"F6 诊断保存失败：{exc}")
+        results = self.analyze(hero, images=images, retry_images=expanded)
         return {"cmd": "UPDATE", "data": results, "layout": layout, "duration": 8000,
                 "timing": ("manual", capture_started, captured, time.perf_counter())}
 
     def _read_title(self, img):
         boxes, _ = self.ocr(img)
         if not boxes:
-            return "", 0.0, []
+            return "", 0.0
         # The card title is larger than its tags. Join only fragments on its
         # row. OCR's global reading order can include tags on the next row.
         lines = []
@@ -364,7 +355,7 @@ class GameAnalyzer:
             lines.append((left, (top + bottom) / 2, bottom - top, text, float(confidence)))
         _, center, height, _, _ = max(lines, key=lambda line: line[2])
         row = sorted(line for line in lines if abs(line[1] - center) <= height / 2)
-        return "".join(line[3] for line in row).strip(), min(line[4] for line in row), boxes
+        return "".join(line[3] for line in row).strip(), min(line[4] for line in row)
 
     @staticmethod
     def _match_title(text, confidence, names):
@@ -386,26 +377,22 @@ class GameAnalyzer:
                 return names[best][0], score
         return None, 0
 
-    def _recognize_title(self, image, names, trace):
-        started = time.perf_counter() if trace is not None else None
-        text, confidence, boxes = self._read_title(image)
+    def _recognize_title(self, image, names):
+        text, confidence = self._read_title(image)
         match, score = self._match_title(text, confidence, names)
-        if trace is not None:
-            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-            trace.append((image, boxes, text, confidence, match, score, elapsed_ms))
         return text, match, score
 
-    def _ocr_and_match(self, key, img, hero_cn, retry_image=None, trace=None):
+    def _ocr_and_match(self, key, img, hero_cn, retry_image=None):
         """Identify the card, then look up this hero's recommendation."""
         try:
             if img is None:
                 return {"key": key, "text": "截图错误", "error": True, "score": 0}
 
             data = self.dm
-            text, match, score = self._recognize_title(img, data.augment_names, trace)
+            text, match, score = self._recognize_title(img, data.augment_names)
             if match is None and retry_image is not None:
                 enhanced = cv2.normalize(retry_image, None, 0, 255, cv2.NORM_MINMAX)
-                retry_text, match, score = self._recognize_title(enhanced, data.augment_names, trace)
+                retry_text, match, score = self._recognize_title(enhanced, data.augment_names)
                 text = retry_text or text
 
             res = {
@@ -435,7 +422,7 @@ class GameAnalyzer:
             print(f"处理异常 ({key}): {e}")
             return {"key": key, "text": "Error", "error": True, "score": 0}
 
-    def analyze(self, hero_cn, images=None, *, retry_images=None, traces=None):
+    def analyze(self, hero_cn, images=None, *, retry_images=None):
         if not hero_cn: return {}
         print(f"正在分析: {hero_cn}...")
         
@@ -443,7 +430,6 @@ class GameAnalyzer:
         if images is None:
             images = self.capture_all_regions()
         retry_images = retry_images or {}
-        traces = traces or {}
         
         # 阶段2: OCR 识别 + 匹配 (自适应并发策略)
         results = {}
@@ -454,7 +440,7 @@ class GameAnalyzer:
             futures = []
             for key in images:
                 futures.append(self.executor.submit(
-                    self._ocr_and_match, key, images[key], hero_cn, retry_images.get(key), traces.get(key)))
+                    self._ocr_and_match, key, images[key], hero_cn, retry_images.get(key)))
             for f in futures:
                 try:
                     data = f.result()
@@ -465,7 +451,7 @@ class GameAnalyzer:
         else:
             # 低端 CPU (<12 线程): 串行 OCR, 避免缓存争抢和线程切换开销
             for key, img in images.items():
-                data = self._ocr_and_match(key, img, hero_cn, retry_images.get(key), traces.get(key))
+                data = self._ocr_and_match(key, img, hero_cn, retry_images.get(key))
                 results[data["key"]] = data
                 if data.get("valid"): valid_matches.append(data)
 
