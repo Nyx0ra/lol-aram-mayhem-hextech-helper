@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import queue
+import unicodedata
 import tkinter as tk
 import ctypes
 import msvcrt  # 用于清除输入缓冲区
@@ -15,13 +16,15 @@ import mss
 import keyboard
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from functools import cached_property
 from thefuzz import process, fuzz
 from scripts.config import BASE_DIR, DATA_DIR
+from scripts.f6_diagnostics import save_f6_diagnostics
 from scripts.lcu_connector import LCUConnector, SessionPoller
 from scripts.overlay_inbox import OverlayInbox
 from scripts.window_layout import (
     CARD_LEFTS, ScreenRect, configure_overlay, enable_per_monitor_dpi,
-    get_game_layout, position_overlay,
+    get_game_layout, has_recognition_overlay, position_overlay,
 )
 from rapidocr_onnxruntime import RapidOCR
 
@@ -37,6 +40,10 @@ COLORS = {
 
 # ================= 1. 数据管理 (Model) =================
 
+def normalize_augment_name(text):
+    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
 class DataManager:
     """负责加载和管理静态数据"""
     def __init__(self):
@@ -47,6 +54,14 @@ class DataManager:
         self.base_dir = BASE_DIR
         self.data_dir = DATA_DIR
         self._load_data()
+
+    @cached_property
+    def augment_names(self):
+        """Index names across heroes independently of their rankings."""
+        index = defaultdict(list)
+        for name in sorted({name for augments in self.hero_data.values() for name in augments}):
+            index[normalize_augment_name(name)].append(name)
+        return dict(index)
 
     def _load_data(self):
         print("--- 正在加载数据资源 ---")
@@ -182,10 +197,13 @@ class GameAnalyzer:
 
     def __init__(self, data_manager):
         self.dm = data_manager
-        # OCR 引擎: 降低 det_limit_side_len (默认736→480)
-        # 截取区域 2x 上采样后最大 640px, 480 足以覆盖, 减少检测模型不必要计算
+        self._cpu_count = os.cpu_count() or 4
+        self._use_parallel = self._cpu_count >= 12
         try:
-            self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=480)
+            # RapidOCR sizes the short side, so 480 unnecessarily enlarges the
+            # narrow title strips. Keep ONNX workers bounded across three cards.
+            self.ocr = RapidOCR(use_cls=False, det_limit_side_len=192,
+                                intra_op_num_threads=min(4, self._cpu_count), inter_op_num_threads=1)
         except (KeyError, TypeError, Exception) as e:
             py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
             print(f"\n❌ OCR 引擎初始化失败: {e}")
@@ -195,9 +213,6 @@ class GameAnalyzer:
             else:
                 print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
             raise
-        # 根据 CPU 逻辑核心数决定并发策略
-        self._cpu_count = os.cpu_count() or 4
-        self._use_parallel = self._cpu_count >= 12
         self.executor = ThreadPoolExecutor(max_workers=3)
         # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
         self._warmup()
@@ -279,19 +294,28 @@ class GameAnalyzer:
         return self.capture_window_frame(target_keys)[1]
 
     @staticmethod
-    def capture_window_frame(target_keys=None):
+    def capture_window_frame(target_keys=None, *, expanded=False):
         """Capture title slices and return the layout used for those pixels."""
         layout = get_game_layout()
         if layout is None:
             return None, {}
-        images = {}
+        regions = {key: layout.title_region(key, expanded=expanded)
+                   for key in (CARD_LEFTS if target_keys is None else target_keys)}
+        if not regions:
+            return layout, {}
+
+        left = min(r.left for r in regions.values())
+        top = min(r.top for r in regions.values())
+        right = max(r.left + r.width for r in regions.values())
+        bottom = max(r.top + r.height for r in regions.values())
         try:
             with mss.mss() as sct:
-                for key in CARD_LEFTS if target_keys is None else target_keys:
-                    r = layout.title_region(key)
-                    raw = sct.grab((r.left, r.top, r.left + r.width, r.top + r.height))
-                    bgra = np.frombuffer(raw.raw, dtype=np.uint8).reshape((raw.height, raw.width, 4))
-                    images[key] = GameAnalyzer.prepare_title(bgra)
+                raw = sct.grab((left, top, right, bottom))
+                bgra = np.frombuffer(raw.raw, dtype=np.uint8).reshape((raw.height, raw.width, 4))
+                images = {}
+                for key, r in regions.items():
+                    x, y = r.left - left, r.top - top
+                    images[key] = GameAnalyzer.prepare_title(bgra[y:y + r.height, x:x + r.width])
         except Exception as e:
             print(f"批量截图失败: {e}")
             return None, {}
@@ -304,86 +328,122 @@ class GameAnalyzer:
         gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
         return cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
 
-    def manual_update(self, hero):
+    def manual_update(self, hero, *, diagnostic_dir=None):
         capture_started = time.perf_counter()
-        layout, images = self.capture_window_frame()
+        layout, expanded = self.capture_window_frame(expanded=True)
         if layout is None:
             return {"cmd": "STATUS", "data": "请将游戏窗口切到前台"}
+        images = {}
+        for key, image in expanded.items():
+            # Both attempts use the pixels present at the time of the hotkey.
+            title = layout.f6_title_region(key)
+            images[key] = image[-title.height * 2:]
         captured = time.perf_counter()
-        results = self.analyze(hero, images=images)
+        traces = {key: [] for key in images} if diagnostic_dir is not None else None
+        results = self.analyze(hero, images=images, retry_images=expanded, traces=traces)
+        if traces is not None:
+            try:
+                path = save_f6_diagnostics(diagnostic_dir, hero, layout, expanded, traces, results,
+                                           ("manual", capture_started, captured, time.perf_counter()))
+                print(f"F6 诊断已保存：{path}")
+            except (OSError, cv2.error) as exc:
+                print(f"F6 诊断保存失败：{exc}")
         return {"cmd": "UPDATE", "data": results, "layout": layout, "duration": 8000,
                 "timing": ("manual", capture_started, captured, time.perf_counter())}
 
-    def _ocr_and_match(self, key, img, hero_cn):
-        """对单张已截取的图片执行 OCR 识别 + 数据匹配"""
+    def _read_title(self, img):
+        boxes, _ = self.ocr(img)
+        if not boxes:
+            return "", 0.0, []
+        # The card title is larger than its tags. Join only fragments on its
+        # row. OCR's global reading order can include tags on the next row.
+        lines = []
+        for corners, text, confidence in boxes:
+            left, top = np.min(corners, axis=0)
+            bottom = np.max(corners, axis=0)[1]
+            lines.append((left, (top + bottom) / 2, bottom - top, text, float(confidence)))
+        _, center, height, _, _ = max(lines, key=lambda line: line[2])
+        row = sorted(line for line in lines if abs(line[1] - center) <= height / 2)
+        return "".join(line[3] for line in row).strip(), min(line[4] for line in row), boxes
+
+    @staticmethod
+    def _match_title(text, confidence, names):
+        normalized = normalize_augment_name(text)
+        exact = names.get(normalized, [])
+        if text in exact:
+            return text, 100
+        if len(exact) == 1:
+            return exact[0], 100
+        if exact or len(normalized) < 3 or confidence < 0.75:
+            return None, 0
+
+        candidates = process.extract(normalized, names.keys(), scorer=fuzz.ratio,
+                                     processor=None, limit=2)
+        if candidates:
+            best, score = candidates[0]
+            next_score = candidates[1][1] if len(candidates) > 1 else 0
+            if len(names[best]) == 1 and score >= 75 and score - next_score >= 10:
+                return names[best][0], score
+        return None, 0
+
+    def _recognize_title(self, image, names, trace):
+        started = time.perf_counter() if trace is not None else None
+        text, confidence, boxes = self._read_title(image)
+        match, score = self._match_title(text, confidence, names)
+        if trace is not None:
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+            trace.append((image, boxes, text, confidence, match, score, elapsed_ms))
+        return text, match, score
+
+    def _ocr_and_match(self, key, img, hero_cn, retry_image=None, trace=None):
+        """Identify the card, then look up this hero's recommendation."""
         try:
             if img is None:
                 return {"key": key, "text": "截图错误", "error": True, "score": 0}
 
-            res_ocr, _ = self.ocr(img)
-            txt = "".join([line[1] for line in res_ocr]) if res_ocr else ""
-            txt = txt.replace(" ", "").replace(".", "")
+            data = self.dm
+            text, match, score = self._recognize_title(img, data.augment_names, trace)
+            if match is None and retry_image is not None:
+                enhanced = cv2.normalize(retry_image, None, 0, 255, cv2.NORM_MINMAX)
+                retry_text, match, score = self._recognize_title(enhanced, data.augment_names, trace)
+                text = retry_text or text
 
             res = {
-                "key": key, "valid": False, "rank": 999, 
-                "text": "", "highlight": False, "error": False, "score": 0
+                "key": key, "valid": False, "rank": 999,
+                "text": "", "highlight": False, "error": False, "score": score,
             }
 
-            if not txt:
-                res["text"] = "❌ 无文字"
+            if match is None:
+                res["text"] = "❌ 未识别" if text else "❌ 无文字"
                 res["error"] = True
                 return res
 
-            hero_augments = self.dm.hero_data.get(hero_cn, {})
-            if not hero_augments:
-                res["text"] = "无数据"
-                res["error"] = True
+            res["match_name"] = match
+            info = data.hero_data.get(hero_cn, {}).get(match)
+            if info is None:
+                res["text"] = f"【{match}】\n暂无本英雄排名"
                 return res
 
-            match_name = None
-            match_score = 0
-            
-            # 1. 精确匹配 (O(1))
-            if txt in hero_augments:
-                match_name = txt
-                match_score = 100
-            else:
-                # 2. 模糊匹配 (使用精确比例 fuzz.ratio，避免子串过分匹配)
-                match, score = process.extractOne(txt, list(hero_augments.keys()), scorer=fuzz.ratio)
-                if score > 60:
-                    match_name = match
-                    match_score = score
-
-            if match_name:
-                info = hero_augments[match_name]
-                tier = info.get('tier', '?')
-                t_rank = info.get('t_rank', '?')
-                overall_rank = info.get('overall_rank', '?')
-                # 格式化显示内容: 方案A
-                res["text"] = f"【{match_name}】\n总No.{overall_rank} | {tier} No.{t_rank}"
-                res["valid"] = True
-                res["tier"] = tier
-                res["score"] = match_score
-                res["match_name"] = match_name
-                res["t_rank"] = info.get('t_rank', 999)
-                res["overall_rank"] = info.get('overall_rank', 999)
-            else:
-                res["text"] = "❌ 未识别"
-                res["error"] = True
-            
+            tier = info.get("tier", "?")
+            overall_rank = info.get("overall_rank", 999)
+            t_rank = info.get("t_rank", 999)
+            res.update(text=f"【{match}】\n总No.{overall_rank} | {tier} No.{t_rank}",
+                       valid=True, tier=tier, t_rank=t_rank, overall_rank=overall_rank)
             return res
             
         except Exception as e:
             print(f"处理异常 ({key}): {e}")
             return {"key": key, "text": "Error", "error": True, "score": 0}
 
-    def analyze(self, hero_cn, images=None):
+    def analyze(self, hero_cn, images=None, *, retry_images=None, traces=None):
         if not hero_cn: return {}
         print(f"正在分析: {hero_cn}...")
         
         # 阶段1: 批量截图 (若外部未提供则现场截图)
         if images is None:
             images = self.capture_all_regions()
+        retry_images = retry_images or {}
+        traces = traces or {}
         
         # 阶段2: OCR 识别 + 匹配 (自适应并发策略)
         results = {}
@@ -393,7 +453,8 @@ class GameAnalyzer:
             # 高端 CPU (>=12 线程): 并发 OCR, 充分利用多核
             futures = []
             for key in images:
-                futures.append(self.executor.submit(self._ocr_and_match, key, images[key], hero_cn))
+                futures.append(self.executor.submit(
+                    self._ocr_and_match, key, images[key], hero_cn, retry_images.get(key), traces.get(key)))
             for f in futures:
                 try:
                     data = f.result()
@@ -404,7 +465,7 @@ class GameAnalyzer:
         else:
             # 低端 CPU (<12 线程): 串行 OCR, 避免缓存争抢和线程切换开销
             for key, img in images.items():
-                data = self._ocr_and_match(key, img, hero_cn)
+                data = self._ocr_and_match(key, img, hero_cn, retry_images.get(key), traces.get(key))
                 results[data["key"]] = data
                 if data.get("valid"): valid_matches.append(data)
 
@@ -596,6 +657,8 @@ class PopupDetector:
 
 class OverlayApp:
     def __init__(self, root):
+        if has_recognition_overlay():
+            raise RuntimeError("另一个 ARAM 助手正在识别，请先停止原实例")
         self.root = root
         self.labels = {}
         self.hide_timer = None

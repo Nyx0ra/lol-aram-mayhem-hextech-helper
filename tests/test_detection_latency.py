@@ -13,6 +13,28 @@ from scripts.overlay_inbox import OverlayInbox
 
 
 class DetectionLatencyTests(unittest.TestCase):
+    def test_gui_status_follows_first_session_snapshot_and_reconnect(self):
+        events = queue.Queue()
+        controller = GUIController(queue.Queue(), events, Mock(), Mock(), None)
+        controller.session_poller = Mock()
+        snapshots = [
+            (("Unknown", None, "Unknown", None), "client_unknown"),
+            (("Lobby", None, "Lobby", None), "waiting"),
+            (("Disconnected", None, "", None), "client_disconnected"),
+            (("Lobby", None, "Lobby", None), "waiting"),
+            (("InProgress", None, "GameFlow", None), "waiting_in_game"),
+            (("EndOfGame", None, "EndOfGame", None), "waiting"),
+        ]
+        for snapshot, status in snapshots:
+            with self.subTest(phase=snapshot[0]):
+                controller.session_poller.snapshot = snapshot
+                controller._sync_session_and_hero()
+                self.assertEqual([e.get("status") for e in list(events.queue)], [status])
+                events.get_nowait()
+                controller.session_poller.snapshot = tuple(list(snapshot))
+                controller._sync_session_and_hero()
+                self.assertTrue(events.empty())
+
     def test_release_defaults_sync_hero_and_scan_only_on_f6(self):
         for controller_type in (GUIController, InputController):
             with self.subTest(controller=controller_type.__name__):

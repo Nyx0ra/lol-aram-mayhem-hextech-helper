@@ -13,6 +13,23 @@ from scripts import updater
 
 
 class LauncherTests(unittest.TestCase):
+    def test_start_refuses_when_another_recognition_overlay_exists(self):
+        app = LauncherApp.__new__(LauncherApp)
+        app.engine_running = app.engine_starting = False
+        app._engine_generation = 0
+        app.dm = Mock(hero_data={"探险家": {}})
+        app.start_btn = Mock()
+        app.stop_btn = Mock()
+        app._set_status = Mock()
+        app._log = Mock()
+        with patch("gui_launcher.has_recognition_overlay", return_value=True, create=True), \
+                patch("gui_launcher.messagebox.showwarning") as warning, \
+                patch("gui_launcher.threading.Thread"):
+            app._start_engine()
+        warning.assert_called_once()
+        self.assertIn("另一个", warning.call_args.args[1])
+        app.start_btn.pack_forget.assert_not_called()
+
     def test_close_during_update_cancels_and_hides_window(self):
         app = LauncherApp.__new__(LauncherApp)
         app._update_running = True

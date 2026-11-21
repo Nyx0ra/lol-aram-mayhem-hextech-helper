@@ -29,12 +29,20 @@ class GameLayout:
         width = min(r.width, round(r.height * 16 / 9))
         return ScreenRect(r.left + (r.width - width) // 2, r.top, width, r.height)
 
-    def title_region(self, key):
+    def title_region(self, key, *, expanded=False):
         r = self.content
+        margin = round(r.height * 0.01) if expanded else 0
         return ScreenRect(r.left + int(r.width * CARD_LEFTS[key]),
-                          r.top + int(r.height * 0.375),
+                          r.top + int(r.height * 0.375) - margin,
                           max(1, int(r.width * 0.125)),
-                          max(1, int(r.height * 0.0417)))
+                          max(1, int(r.height * 0.0417)) + 2 * margin)
+
+    def f6_title_region(self, key):
+        title = self.title_region(key)
+        expanded = self.title_region(key, expanded=True)
+        # Real reroll frames have title strokes below the original bottom edge.
+        return ScreenRect(title.left, title.top, title.width,
+                          expanded.top + expanded.height - title.top)
 
     def icon_region(self, key):
         """Conservative crop around the artwork above the title."""
@@ -83,6 +91,11 @@ def enable_per_monitor_dpi():
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
     except (AttributeError, OSError):
         _user32.SetProcessDPIAware()
+
+
+def has_recognition_overlay():
+    """Detect the Tk overlay used by both current and older assistant builds."""
+    return bool(_find_window("TkTopLevel", "ARAM Overlay"))
 
 
 def get_game_layout():

@@ -230,8 +230,14 @@ class ReplayDatasetTests(unittest.TestCase):
     def test_png_replay_scores_new_card_and_reports_wrong_ground_truth(self):
         analyzer = GameAnalyzer.__new__(GameAnalyzer)
         analyzer._use_parallel = False
-        analyzer.dm = Mock(hero_data={"hero": {"旧卡": {}, "新卡": {}}})
-        analyzer.ocr = lambda image: ([[None, "旧卡" if image[0, 0] == 40 else "新卡"]], None)
+        analyzer.dm = DataManager.__new__(DataManager)
+        analyzer.dm.hero_data = {"hero": {
+            "旧卡": {"tier": "黄金", "overall_rank": 2, "t_rank": 2},
+            "新卡": {"tier": "黄金", "overall_rank": 1, "t_rank": 1},
+        }}
+        analyzer.ocr = lambda image: (
+            [([[8, 1], [24, 1], [24, 8], [8, 8]],
+              "旧卡" if image[0, 0] == 40 else "新卡", 0.99)], None)
         old = np.tile(np.array([40, 180] * 16, dtype=np.uint8), (10, 1))
         new = np.roll(old, 1, axis=1)
         frames = [

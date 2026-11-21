@@ -16,6 +16,8 @@ def get_base_dir():
 
 BASE_DIR = get_base_dir()
 DATA_DIR = os.path.join(BASE_DIR, 'data')
+F6_DIAGNOSTICS_DIR = os.path.join(os.getenv("LOCALAPPDATA") or BASE_DIR,
+                                  "ARAMHelper", "F6Diagnostics")
 
 # 数据文件路径常量
 CHAMPION_ID_FILE = os.path.join(DATA_DIR, "champions.json")

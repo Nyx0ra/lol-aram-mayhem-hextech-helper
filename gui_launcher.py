@@ -16,7 +16,8 @@ import traceback
 
 # ============ 路径初始化 (兼容 PyInstaller 打包) ============
 
-from scripts.config import get_base_dir, BASE_DIR
+from scripts.config import get_base_dir, BASE_DIR, F6_DIAGNOSTICS_DIR
+from scripts.window_layout import has_recognition_overlay
 os.chdir(BASE_DIR)
 sys.path.insert(0, BASE_DIR)
 
@@ -108,6 +109,7 @@ class GUIController(threading.Thread):
         self.current_phase = "Unknown"
         self.is_manual_hero = False
         self.auto_popup_enabled = auto_popup
+        self.save_f6_diagnostics = False
         self.running = True
 
         from main import PopupDetector
@@ -229,7 +231,10 @@ class GUIController(threading.Thread):
             else:
                 self._gui(event="status", status="analyzing", hero=self.current_hero)
                 self.overlay_queue.put({"cmd": "STATUS", "data": f"🔎 分析 [{self.current_hero}]...", "duration": 1500})
-                message = self.analyzer.manual_update(self.current_hero)
+                if self.save_f6_diagnostics:
+                    message = self.analyzer.manual_update(self.current_hero, diagnostic_dir=F6_DIAGNOSTICS_DIR)
+                else:
+                    message = self.analyzer.manual_update(self.current_hero)
                 self.detector.reset(opening=self.detector.opening)
                 self.overlay_queue.put(message)
                 self._overlay_is_showing = message["cmd"] == "UPDATE"
@@ -262,6 +267,7 @@ class GUIController(threading.Thread):
         snapshot = self.session_poller.snapshot if self.session_poller else None
         if snapshot is None or snapshot is self._session_snapshot:
             return
+        first_snapshot = self._session_snapshot is None
         self._session_snapshot = snapshot
         phase, raw_hero, source, _ = snapshot
         old_phase, self.current_phase = self.current_phase, phase
@@ -270,7 +276,6 @@ class GUIController(threading.Thread):
             self._clear_detection(opening=True)
         elif old_phase == "InProgress" and phase != "InProgress":
             self._clear_detection()
-            self._gui(event="status", status="listening")
 
         if phase in ("ChampSelect", "Lobby", "Matchmaking") and old_phase in ("InProgress", "GameStart"):
             self.is_manual_hero = False
@@ -286,10 +291,22 @@ class GUIController(threading.Thread):
                 self.overlay_queue.put({
                     "cmd": "STATUS", "data": f"当前: {validated}\n弹窗打开后按 F6", "duration": 2500,
                 })
-        elif refresh:
-            self.overlay_queue.put({
-                "cmd": "STATUS", "data": f"当前: {self.current_hero or '未识别'}\n阶段: {phase}", "duration": 2000,
-            })
+        elif first_snapshot or phase != old_phase or refresh:
+            if phase == "Disconnected":
+                status = "client_disconnected"
+            elif phase == "Unknown":
+                status = "client_unknown"
+            elif validated or (self.is_manual_hero and self.current_hero):
+                status = "listening"
+            elif phase in ("GameStart", "InProgress"):
+                status = "waiting_in_game"
+            else:
+                status = "waiting"
+            self._gui(event="status", status=status)
+            if refresh:
+                self.overlay_queue.put({
+                    "cmd": "STATUS", "data": f"当前: {self.current_hero or '未识别'}\n阶段: {phase}", "duration": 2000,
+                })
 
     def _check_in_game_popup(self):
         message = self.detector.sample_window(self.current_hero, self._last_popup_check)
@@ -654,6 +671,7 @@ class LauncherApp:
         # UI 变量
         self.hero_var = tk.StringVar(value="—")
         self.status_var = tk.StringVar(value="等待启动")
+        self.f6_diagnostics_var = tk.BooleanVar(value=False)
         self.status_color = self.TEXT_DIM
         self._pulse_state = 0
 
@@ -719,6 +737,10 @@ class LauncherApp:
         s.map('Link.TButton',
               foreground=[('active', self.ACCENT)],
               background=[('active', self.BG)])
+
+        s.configure('Diagnostics.TCheckbutton', background=self.BG, foreground=self.TEXT_DIM,
+                    font=self.FONT_SUB)
+        s.map('Diagnostics.TCheckbutton', background=[('active', self.BG)])
 
     # ==========================================
     # 构建 UI
@@ -809,6 +831,10 @@ class LauncherApp:
             tk.Label(inner, text=desc, font=("Microsoft YaHei", 9),
                      fg=self.TEXT_DIM, bg=self.BG_CARD).pack(side=tk.LEFT)
 
+        ttk.Checkbutton(main, text="保存 F6 诊断（标题截图和 OCR 结果）",
+                        variable=self.f6_diagnostics_var, command=self._toggle_f6_diagnostics,
+                        style='Diagnostics.TCheckbutton').pack(anchor=tk.W, pady=(0, 8))
+
         # ---- 按钮区域 ----
         btn_frame = tk.Frame(main, bg=self.BG)
         btn_frame.pack(fill=tk.X, pady=(0, 12))
@@ -880,12 +906,22 @@ class LauncherApp:
     # 引擎控制
     # ==========================================
 
+    def _toggle_f6_diagnostics(self):
+        enabled = self.f6_diagnostics_var.get()
+        if self.controller is not None:
+            self.controller.save_f6_diagnostics = enabled
+        if enabled:
+            self._log(f"F6 诊断目录：{F6_DIAGNOSTICS_DIR}")
+
     def _start_engine(self):
         """启动识别引擎"""
         if self.engine_running or self.engine_starting:
             return
         if not self.dm or not self.dm.hero_data:
             messagebox.showwarning("提示", "数据尚未加载完成，请稍候")
+            return
+        if has_recognition_overlay():
+            messagebox.showwarning("识别已在运行", "另一个 ARAM 助手正在识别。请先在原窗口停止运行或从托盘退出。")
             return
 
         self.start_btn.pack_forget()
@@ -946,6 +982,7 @@ class LauncherApp:
                 self.overlay.queue, self.gui_queue, analyzer.dm, analyzer, lcu,
                 generation=self._engine_generation,
             )
+            controller.save_f6_diagnostics = self.f6_diagnostics_var.get()
             if analyzer.dm is not self.dm:
                 controller.data_updates.put(self.dm)
             controller.start()
@@ -970,6 +1007,7 @@ class LauncherApp:
             self.stop_btn.pack_forget()
             self.start_btn.pack(fill=tk.X, pady=(0, 8))
             self.start_btn.config(state=tk.NORMAL)
+            self._set_status("识别启动失败", self.ERROR)
 
     def _stop_engine(self):
         """停止识别引擎"""
@@ -1156,7 +1194,10 @@ class LauncherApp:
                 self.hero_var.set(hero)
             status_map = {
                 "connecting":       ("连接客户端...", self.WARNING),
-                "waiting":          ("等待选取英雄...", self.WARNING),
+                "waiting":          ("已连接，等待选人", self.SUCCESS),
+                "waiting_in_game":  ("等待同步英雄...", self.WARNING),
+                "client_disconnected": ("客户端未连接，自动重试", self.WARNING),
+                "client_unknown":   ("等待客户端状态...", self.WARNING),
                 "listening":        ("监听中", self.SUCCESS),
                 "analyzing":        ("分析中...", self.ACCENT),
                 "analyzed":         ("分析完成", self.SUCCESS),
