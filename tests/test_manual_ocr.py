@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from main import DataManager, GameAnalyzer
-from scripts.window_layout import CARD_LEFTS, GameLayout, ScreenRect
+from scripts.window_layout import CARD_LEFTS, FOUR_CARD_LEFTS, GameLayout, ScreenRect
 
 
 def ocr_box(text, left=60, top=30, width=90, height=35, confidence=0.99):
@@ -61,46 +61,90 @@ class ManualOCRTests(unittest.TestCase):
         self.assertFalse(result["valid"])
         self.assertNotIn("match_name", result)
 
-    def test_f6_retries_only_failed_cards_from_same_capture(self):
-        layout = GameLayout(1, ScreenRect(-2560, 20, 2560, 1440))
+    @staticmethod
+    def frame_with_titles(layout, keys):
+        # Fill only the centered title text; card boxes of the other layout
+        # partially overlap these rectangles but not the text itself.
         frame = np.zeros((1440, 2560, 4), dtype=np.uint8)
-        for i, key in enumerate(CARD_LEFTS, 1):
+        for i, key in enumerate(keys, 1):
             rect = layout.title_region(key)
-            x, y = rect.left - layout.client.left, rect.top - layout.client.top
-            frame[y:y + rect.height, x:x + rect.width, :3] = i * 40
+            x, y = rect.left - layout.client.left + rect.width // 4, rect.top - layout.client.top
+            frame[y:y + rect.height, x:x + rect.width // 2, :3] = i * 40
+        return frame
 
+    @staticmethod
+    def grabber(layout, frame):
         def grab(bounds):
             left, top, right, bottom = bounds
             crop = frame[top - layout.client.top:bottom - layout.client.top,
                          left - layout.client.left:right - layout.client.left]
             return SimpleNamespace(height=crop.shape[0], width=crop.shape[1], raw=crop.tobytes())
+        return grab
+
+    def run_f6(self, layout, frame, read, parallel=False):
+        with patch("main.get_game_layout", return_value=layout), patch("main.mss.mss") as mss:
+            self.analyzer._use_parallel = parallel
+            self.analyzer.ocr = Mock(side_effect=read)
+            capture = mss.return_value.__enter__.return_value.grab
+            capture.side_effect = self.grabber(layout, frame)
+            result = self.analyzer.manual_update("英雄")["data"]
+            capture.assert_called_once()
+            return result
+
+    def test_f6_retries_only_failed_cards_from_same_capture(self):
+        layout = GameLayout(1, ScreenRect(-2560, 20, 2560, 1440))
+        frame = self.frame_with_titles(layout, CARD_LEFTS)
 
         def read(image):
             if image.shape[0] == 176:
                 return [ocr_box("珠光护手"), ocr_box("伤害", top=90, height=16)], None
-            if image[60, 320] == 80:
+            if image[60, 320] in (0, 80):  # four-card boxes are blank; hex_2 is unreadable
                 return None, None
             return [ocr_box("心灵净化")], None
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             self.analyzer.executor = executor
             for parallel in (False, True):
-                with self.subTest(parallel=parallel), patch("main.get_game_layout", return_value=layout), \
-                        patch("main.mss.mss") as mss:
-                    self.analyzer._use_parallel = parallel
-                    self.analyzer.ocr = Mock(side_effect=read)
-                    capture = mss.return_value.__enter__.return_value.grab
-                    capture.side_effect = grab
-                    result = self.analyzer.manual_update("英雄")["data"]
+                with self.subTest(parallel=parallel):
+                    result = self.run_f6(layout, frame, read, parallel)
+                    self.assertEqual(list(result), list(CARD_LEFTS))
                     self.assertEqual([row.get("match_name") for row in result.values()],
                                      ["心灵净化", "珠光护手", "心灵净化"])
                     self.assertEqual([row["highlight"] for row in result.values()], [True, False, True])
                     self.assertCountEqual(
                         [call.args[0].shape for call in self.analyzer.ocr.call_args_list],
-                        [(148, 640)] * 3 + [(176, 640)],
+                        [(148, 640)] * 7 + [(176, 640)],
                     )
-                    self.assertEqual(self.analyzer.ocr.call_count, 4)
-                    capture.assert_called_once()
+
+    def test_f6_reads_four_card_offer(self):
+        layout = GameLayout(1, ScreenRect(0, 0, 2560, 1440))
+        frame = self.frame_with_titles(layout, FOUR_CARD_LEFTS)
+        names = {40: "珠光护手", 80: "心灵净化", 120: "升级：耀光", 160: "？？？"}
+
+        def read(image):
+            name = names.get(int(image[60, 320]))
+            return ([ocr_box(name)], None) if name else (None, None)
+
+        result = self.run_f6(layout, frame, read)
+        self.assertEqual(list(result), list(FOUR_CARD_LEFTS))
+        self.assertEqual([row.get("match_name") for row in result.values()],
+                         ["珠光护手", "心灵净化", "升级：耀光", "？？？"])
+        self.assertEqual([row["highlight"] for row in result.values()], [False, True, False, False])
+        self.assertEqual(self.analyzer.ocr.call_count, 7)
+
+    def test_f6_retries_both_layouts_when_nothing_is_readable(self):
+        layout = GameLayout(1, ScreenRect(0, 0, 2560, 1440))
+        frame = self.frame_with_titles(layout, FOUR_CARD_LEFTS)
+
+        def read(image):
+            # Only enhanced, expanded crops centered on a title read.
+            if image.shape[0] == 176 and image[88, 320] > 0 and image[88, 0] == 0:
+                return [ocr_box("心灵净化")], None
+            return None, None
+
+        result = self.run_f6(layout, frame, read)
+        self.assertEqual(list(result), list(FOUR_CARD_LEFTS))
+        self.assertEqual(self.analyzer.ocr.call_count, 14)
 
 
 if __name__ == "__main__":

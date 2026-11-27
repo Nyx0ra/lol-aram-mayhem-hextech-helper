@@ -22,7 +22,7 @@ from scripts.config import BASE_DIR, DATA_DIR
 from scripts.lcu_connector import LCUConnector, SessionPoller
 from scripts.overlay_inbox import OverlayInbox
 from scripts.window_layout import (
-    CARD_LEFTS, ScreenRect, configure_overlay, enable_per_monitor_dpi,
+    ALL_CARD_LEFTS, CARD_GROUPS, CARD_LEFTS, ScreenRect, configure_overlay, enable_per_monitor_dpi,
     get_game_layout, has_recognition_overlay, position_overlay,
 )
 from rapidocr_onnxruntime import RapidOCR
@@ -329,7 +329,7 @@ class GameAnalyzer:
 
     def manual_update(self, hero):
         capture_started = time.perf_counter()
-        layout, expanded = self.capture_window_frame(expanded=True)
+        layout, expanded = self.capture_window_frame(ALL_CARD_LEFTS, expanded=True)
         if layout is None:
             return {"cmd": "STATUS", "data": "请将游戏窗口切到前台"}
         images = {}
@@ -338,9 +338,38 @@ class GameAnalyzer:
             title = layout.f6_title_region(key)
             images[key] = image[-title.height * 2:]
         captured = time.perf_counter()
-        results = self.analyze(hero, images=images, retry_images=expanded)
+        results = self._analyze_best_group(hero, images, expanded)
         return {"cmd": "UPDATE", "data": results, "layout": layout, "duration": 8000,
                 "timing": ("manual", capture_started, captured, time.perf_counter())}
+
+    @staticmethod
+    def _matched(results):
+        return sum("match_name" in item for item in results.values())
+
+    def _analyze_best_group(self, hero, images, retry_images):
+        """The offer has three or four cards. Their title boxes do not overlap,
+        so read every box once, keep the layout with more card names, then
+        retry only that layout's unreadable cards with the expanded crop."""
+        def subset(source, keys):
+            return {key: source[key] for key in keys if key in source}
+
+        group_results = [self.analyze(hero, images=subset(images, keys)) for keys in CARD_GROUPS]
+        if max(map(self._matched, group_results)) == 0:
+            # Nothing readable in either layout: retry both, as the old
+            # three-card path retried every card.
+            group_results = [
+                self.analyze_partial(hero, subset(retry_images, keys), results, list(results),
+                                     enhance=True)
+                for keys, results in zip(CARD_GROUPS, group_results)
+            ]
+            return max(group_results, key=self._matched)
+
+        results = max(group_results, key=self._matched)  # ties keep three cards
+        failed = [key for key, item in results.items() if "match_name" not in item]
+        if not failed:
+            return results
+        return self.analyze_partial(hero, subset(retry_images, failed), results, failed,
+                                    enhance=True)
 
     def _read_title(self, img):
         boxes, _ = self.ocr(img)
@@ -471,18 +500,23 @@ class GameAnalyzer:
         
         return results
 
-    def analyze_partial(self, hero_cn, images, existing_results, target_keys):
+    def analyze_partial(self, hero_cn, images, existing_results, target_keys, *, enhance=False):
         """
         局部增量分析 (用于单卡刷新 Reroll):
         仅对 target_keys 中的区域重新跑 OCR，其余卡牌复用已有结果，然后统一重新计算胜率排名。
-        单卡刷新重算速度提升 300%！
+        enhance=True 时作为 F6 重试：增强对比度后识别，未匹配则保留原结果。
         """
         if not hero_cn: return {}
         results = {key: item.copy() for key, item in existing_results.items()} if existing_results else {}
         for key in target_keys:
             img = images.get(key)
-            if img is not None:
-                results[key] = self._ocr_and_match(key, img, hero_cn)
+            if img is None:
+                continue
+            if enhance:
+                img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+            item = self._ocr_and_match(key, img, hero_cn)
+            if not enhance or "match_name" in item or key not in results:
+                results[key] = item
 
         # 统一重新计算最优推荐
         valid_matches = [v for v in results.values() if v.get("valid")]
@@ -684,7 +718,7 @@ class OverlayApp:
         
     def _setup_labels(self):
         font_style = ("Microsoft YaHei", 14, "bold")
-        for key in CARD_LEFTS:
+        for key in ALL_CARD_LEFTS:
             lbl = tk.Label(self.root, text="", font=font_style, bg=COLORS["bg"], justify="left")
             self.labels[key] = lbl
 
