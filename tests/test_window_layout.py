@@ -17,6 +17,22 @@ class WindowLayoutTests(unittest.TestCase):
         self.assertEqual(normal.content, normal.client)
         self.assertEqual(normal.title_region("hex_3"), win.ScreenRect(1223, 445, 240, 45))
 
+    def test_four_card_titles_are_centered_and_clear_of_three_card_titles(self):
+        layout = win.GameLayout(42, win.ScreenRect(0, 0, 2560, 1440))
+        quads = [layout.title_region(key) for key in win.FOUR_CARD_LEFTS]
+        centers = [r.left + r.width / 2 for r in quads]
+        self.assertAlmostEqual(centers[0] + centers[3], 2560, delta=2)
+        self.assertAlmostEqual(centers[1] + centers[2], 2560, delta=2)
+        self.assertTrue(all(0 <= r.left and r.left + r.width <= 2560 for r in quads))
+        # Title text sits in the middle half of a box. Neither layout's text
+        # may fall inside the other layout's text area.
+        for key in win.CARD_LEFTS:
+            title = layout.title_region(key)
+            text = (title.left + title.width / 4, title.left + title.width * 3 / 4)
+            for quad in quads:
+                self.assertTrue(text[1] <= quad.left + quad.width / 4 or
+                                text[0] >= quad.left + quad.width * 3 / 4)
+
     def test_client_snapshot_uses_both_transformed_corners(self):
         def client_rect(hwnd, rect):
             value = ctypes.cast(rect, ctypes.POINTER(wintypes.RECT)).contents

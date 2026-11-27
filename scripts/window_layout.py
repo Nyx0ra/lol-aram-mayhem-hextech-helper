@@ -6,6 +6,14 @@ from dataclasses import dataclass
 
 
 CARD_LEFTS = {"hex_1": 0.2539, "hex_2": 0.4414, "hex_3": 0.625}
+# Four-card offers are centered with a wider pitch than three-card ones:
+# 0.192 of the 16:9 width, measured from a 4-card match frame (card frames at
+# 256/642/1026/1410 of 2000 px, 384 px apart). Distinct keys let one capture
+# and one overlay hold both layouts.
+FOUR_CARD_LEFTS = {f"quad_{i + 1}": round(0.5 + (i - 1.5) * 0.192 - 0.0625, 4)
+                   for i in range(4)}
+CARD_GROUPS = (tuple(CARD_LEFTS), tuple(FOUR_CARD_LEFTS))
+ALL_CARD_LEFTS = {**CARD_LEFTS, **FOUR_CARD_LEFTS}
 
 
 @dataclass(frozen=True)
@@ -32,7 +40,7 @@ class GameLayout:
     def title_region(self, key, *, expanded=False):
         r = self.content
         margin = round(r.height * 0.01) if expanded else 0
-        return ScreenRect(r.left + int(r.width * CARD_LEFTS[key]),
+        return ScreenRect(r.left + int(r.width * ALL_CARD_LEFTS[key]),
                           r.top + int(r.height * 0.375) - margin,
                           max(1, int(r.width * 0.125)),
                           max(1, int(r.height * 0.0417)) + 2 * margin)
@@ -47,7 +55,7 @@ class GameLayout:
     def icon_region(self, key):
         """Conservative crop around the artwork above the title."""
         r = self.content
-        return ScreenRect(r.left + int(r.width * (CARD_LEFTS[key] + 0.0125)),
+        return ScreenRect(r.left + int(r.width * (ALL_CARD_LEFTS[key] + 0.0125)),
                           r.top + int(r.height * 0.195),
                           max(1, int(r.width * 0.10)),
                           max(1, int(r.height * 0.165)))
